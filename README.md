@@ -2,6 +2,15 @@
 
 Personality-driven, multi-agent AI system with cloud-based inference and memory, accessible from Android via a web client. All compute runs server-side — no local hardware or model downloads required.
 
+## Android / web client
+
+A single-page PWA is served directly by the backend at `/` (`backend/static/index.html` — no build step, no separate host). Open the Render URL on an Android phone in Chrome, enter the API key in Settings (gear icon), pick an agent from the dropdown, and chat. "Add to Home Screen" installs it as a standalone app icon via the manifest + service worker in `backend/static/`.
+
+Client-side notes:
+- The API key is stored in the browser's `localStorage`, sent only as an `X-API-Key` header to this same-origin backend — never committed, never sent anywhere else.
+- Each agent gets its own `session_id` and message history in `localStorage`, matching the backend's per-agent memory scoping — switching agents shows that agent's own conversation, not a mixed one.
+- Verified end to end with a real browser (Playwright): entering a key, picking an agent, sending a message, and getting back a real Mistral-backed reply, plus confirming history correctly persists per agent when switching back and forth.
+
 ## Backend (Phase 1: minimal walking skeleton)
 
 A FastAPI service that proxies chat messages to Mistral, with SQLite-backed conversation memory and six personas (NEXUS, FORGE, ORACLE, SENTINEL, CODEX, AVERY) loaded from YAML at startup.
@@ -61,4 +70,4 @@ curl http://127.0.0.1:8000/memory/stats -H "X-API-Key: $APP_API_KEY"
 
 ### Next steps
 
-Build the Android PWA client.
+The original plan's phases are now all in place: cloud backend, remote inference, memory, personas, full agent swarm, and the Android/web client. From here it's iteration — durable memory (Turso/Supabase to survive Render redeploys), the KAIROS/SAGE self-improvement loops, and hardening (rate limiting, real auth beyond a shared API key) as this gets used for real.
