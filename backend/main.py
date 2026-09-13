@@ -56,6 +56,7 @@ class ChatResponse(BaseModel):
     session_id: str
     agent: str
     message_id: int
+    delegated_to: list[str] = []
 
 
 class FeedbackRequest(BaseModel):
@@ -82,11 +83,14 @@ def enforce_rate_limit(identifier: str) -> None:
         )
 
 
-async def _call_mistral(messages: list[dict]) -> str:
+async def _call_mistral_raw(messages: list[dict], tools: list[dict] | None = None) -> dict:
     if not MISTRAL_API_KEY:
         raise HTTPException(status_code=500, detail="MISTRAL_API_KEY is not configured on the server")
 
     payload = {"model": MISTRAL_MODEL, "messages": messages}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
     headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}"}
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -100,8 +104,109 @@ async def _call_mistral(messages: list[dict]) -> str:
         except httpx.RequestError as exc:
             raise HTTPException(status_code=502, detail=f"Failed to reach Mistral API: {exc}") from exc
 
-    data = resp.json()
+    return resp.json()
+
+
+async def _call_mistral(messages: list[dict]) -> str:
+    data = await _call_mistral_raw(messages)
     return data["choices"][0]["message"]["content"]
+
+
+# Real agent-to-agent delegation: NEXUS gets a tool letting it hand a task to one of the
+# specialized agents and get their actual response back, rather than just telling the user
+# which agent to switch to. Only NEXUS carries this tool -- the specialists themselves don't
+# delegate further, which structurally rules out delegation loops between agents.
+MAX_DELEGATIONS_PER_TURN = 2  # forces a plain final answer if the model won't stop delegating
+
+
+def _delegatable_agents() -> list[str]:
+    return [name for name in list_personas() if name != "nexus"]
+
+
+def _delegate_tool_schema() -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": "delegate_to_agent",
+            "description": (
+                "Hand a task to one of AILicious's specialized agents and get their real "
+                "response back. Use this when a request clearly fits a specialist better than "
+                "general conversation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "enum": _delegatable_agents(),
+                        "description": "Which specialized agent to delegate to.",
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "The task or question to hand to that agent, in its own words.",
+                    },
+                },
+                "required": ["agent", "task"],
+            },
+        },
+    }
+
+
+async def _execute_delegation(call: dict, session_id: str) -> tuple[str | None, str]:
+    """Runs one delegate_to_agent tool call for real -- through the same run_agent_chat path
+    a direct user message would take, so the delegate agent's own memory and digest see it
+    exactly as if the user had asked it themselves. Never raises: a delegation failure comes
+    back as a tool result NEXUS can react to, not an error that kills the whole turn.
+    """
+    try:
+        args = json.loads(call["function"]["arguments"])
+        agent = args["agent"]
+        task = args["task"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return None, f"Delegation failed: malformed tool call ({exc})"
+
+    if agent not in _delegatable_agents():
+        return None, f"Delegation failed: '{agent}' is not a valid agent to delegate to."
+
+    try:
+        delegate_response = await run_agent_chat(agent, task, session_id)
+    except HTTPException as exc:
+        return None, f"Delegation to {agent} failed: {exc.detail}"
+    except Exception as exc:  # noqa: BLE001 - a delegation hiccup must never break NEXUS's turn
+        return None, f"Delegation to {agent} failed: {exc}"
+
+    return agent, f"{agent.upper()} responded: {delegate_response.response}"
+
+
+async def _run_nexus_turn(messages: list[dict], session_id: str) -> tuple[str, list[str]]:
+    conversation = list(messages)
+    delegated_to: list[str] = []
+
+    for _ in range(MAX_DELEGATIONS_PER_TURN):
+        data = await _call_mistral_raw(conversation, tools=[_delegate_tool_schema()])
+        choice_message = data["choices"][0]["message"]
+        tool_calls = choice_message.get("tool_calls")
+
+        if not tool_calls:
+            return choice_message.get("content") or "", delegated_to
+
+        conversation.append(choice_message)
+        for call in tool_calls:
+            agent_name, result_text = await _execute_delegation(call, session_id)
+            if agent_name:
+                delegated_to.append(agent_name)
+            conversation.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "name": call["function"]["name"],
+                    "content": result_text,
+                }
+            )
+
+    # Ran out of delegation rounds -- force a plain final answer without further tool access.
+    final = await _call_mistral(conversation)
+    return final, delegated_to
 
 
 def _schedule_digest(agent: str) -> None:
@@ -138,7 +243,10 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
         messages.append({"role": "system", "content": f"What you know about this user so far:\n{digest_text}"})
     messages += recent_tail + [{"role": "user", "content": message}]
 
-    reply = await _call_mistral(messages)
+    if agent == "nexus":
+        reply, delegated_to = await _run_nexus_turn(messages, session_id)
+    else:
+        reply, delegated_to = await _call_mistral(messages), []
 
     await asyncio.to_thread(add_message, session_id, agent, "user", message)
     message_id = await asyncio.to_thread(add_message, session_id, agent, "assistant", reply)
@@ -151,7 +259,9 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
     if pause_triggered or await asyncio.to_thread(should_digest, agent):
         _schedule_digest(agent)
 
-    return ChatResponse(response=reply, session_id=session_id, agent=agent, message_id=message_id)
+    return ChatResponse(
+        response=reply, session_id=session_id, agent=agent, message_id=message_id, delegated_to=delegated_to
+    )
 
 
 SAGE_ANALYSIS_SYSTEM_PROMPT = (

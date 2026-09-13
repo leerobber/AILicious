@@ -377,6 +377,215 @@ def test_chat_schedules_digest_once_threshold_crossed(client, monkeypatch):
     assert scheduled_digest_agents == ["nexus"]
 
 
+def test_nexus_chat_without_tool_call_behaves_normally(client):
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hello"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["response"] == "mocked reply"
+    assert body["delegated_to"] == []
+    # NEXUS's own call carries the delegation tool even when it doesn't use it this turn.
+    assert sent_requests[-1]["tools"][0]["function"]["name"] == "delegate_to_agent"
+
+
+def test_non_nexus_chat_does_not_include_delegation_tool(client):
+    client.post("/agents/forge", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+    assert "tools" not in sent_requests[-1]
+
+
+def test_nexus_delegates_to_forge_and_records_forge_history(client, monkeypatch):
+    tool_call_args = json.dumps({"agent": "forge", "task": "write a hello world function"})
+    call_log: list[dict] = []
+
+    async def sequenced_post(self, url, json=None, headers=None, **kwargs):
+        call_log.append(json)
+        if len(call_log) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "delegate_to_agent", "arguments": tool_call_args},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        if len(call_log) == 2:
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "def hello(): print('hello')"}}]},
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "FORGE wrote: def hello(): print('hello')"}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", sequenced_post)
+
+    resp = client.post(
+        "/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "ask forge for a hello world function"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["delegated_to"] == ["forge"]
+    assert body["response"] == "FORGE wrote: def hello(): print('hello')"
+    assert len(call_log) == 3  # NEXUS decides -> FORGE actually runs -> NEXUS synthesizes
+
+    from core.memory import get_history
+
+    forge_history = get_history(body["session_id"], "forge")
+    assert any(m["content"] == "write a hello world function" for m in forge_history)
+    assert any(m["content"] == "def hello(): print('hello')" for m in forge_history)
+
+
+def test_nexus_delegation_malformed_arguments_does_not_crash(client, monkeypatch):
+    call_log: list[dict] = []
+
+    async def sequenced_post(self, url, json=None, headers=None, **kwargs):
+        call_log.append(json)
+        if len(call_log) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "delegate_to_agent", "arguments": "not json"},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "Handled gracefully."}}]}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", sequenced_post)
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+    assert resp.status_code == 200
+    assert resp.json()["response"] == "Handled gracefully."
+    assert resp.json()["delegated_to"] == []
+
+
+def test_nexus_delegation_unknown_agent_does_not_delegate(client, monkeypatch):
+    tool_call_args = json.dumps({"agent": "doesnotexist", "task": "x"})
+    call_log: list[dict] = []
+
+    async def sequenced_post(self, url, json=None, headers=None, **kwargs):
+        call_log.append(json)
+        if len(call_log) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "delegate_to_agent", "arguments": tool_call_args},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "Couldn't find that agent."}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", sequenced_post)
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+    assert resp.status_code == 200
+    assert resp.json()["delegated_to"] == []
+
+    # Isolates the explicit agent-name check specifically (not just "the turn didn't crash",
+    # which a broader exception handler around run_agent_chat would also guarantee): a bogus
+    # agent name must never even reach run_agent_chat, so it should leave no trace in the
+    # digest table -- proven with a raw read that doesn't itself upsert a row.
+    from core import digest as digest_module
+
+    conn = digest_module._get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM conversation_digests WHERE agent = ?", ("doesnotexist",)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is None
+
+
+def test_nexus_delegation_loop_is_capped(client, monkeypatch):
+    tool_call_args = json.dumps({"agent": "forge", "task": "x"})
+    call_log: list[dict] = []
+
+    async def always_delegate_post(self, url, json=None, headers=None, **kwargs):
+        call_log.append(json)
+        if json.get("tools"):
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": f"call_{len(call_log)}",
+                                        "type": "function",
+                                        "function": {"name": "delegate_to_agent", "arguments": tool_call_args},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "forge reply"}}]}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", always_delegate_post)
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "loop please"})
+    assert resp.status_code == 200
+    assert resp.json()["response"] == "forge reply"
+    # 2 rounds x (NEXUS-decides + FORGE-runs) + 1 forced final answer = 5 calls total.
+    assert len(call_log) == 5
+
+
 def test_cross_agent_memory_does_not_leak(client):
     forge_resp = client.post("/agents/forge", headers={"X-API-Key": VALID_KEY}, json={"message": "forge secret"})
     session_id = forge_resp.json()["session_id"]
