@@ -71,6 +71,35 @@ def test_history_respects_limit_and_chronological_order():
     assert [m["content"] for m in history] == ["msg2", "msg3", "msg4"]
 
 
+def test_high_utility_message_survives_over_recent_filler():
+    # 25 short (near-zero heuristic score) messages; a plain recency LIMIT of 20 would
+    # keep only the newest 20, dropping the oldest 5 (msg0..msg4).
+    ids = [memory_module.add_message("s1", "nexus", "user", f"msg{i}") for i in range(25)]
+
+    # Upvote the message that would otherwise be the very first one dropped, boosting
+    # its utility_score enough to outrank plain recency.
+    memory_module.set_feedback(ids[0], 1)
+
+    history = memory_module.get_history("s1", "nexus", limit=20)
+    contents = [m["content"] for m in history]
+
+    assert "msg0" in contents  # survived despite being older than the recency cutoff
+    assert len(contents) == 20
+    assert contents == sorted(contents, key=lambda c: int(c.removeprefix("msg")))  # still chronological
+
+
+def test_zero_utility_history_matches_plain_recency():
+    # No feedback anywhere: KAIROS's ranking must collapse to exactly what a bare
+    # `ORDER BY id DESC LIMIT` would return — no behavior change for the common case.
+    for i in range(25):
+        memory_module.add_message("s1", "nexus", "user", f"msg{i}")
+
+    history = memory_module.get_history("s1", "nexus", limit=20)
+    contents = [m["content"] for m in history]
+
+    assert contents == [f"msg{i}" for i in range(5, 25)]
+
+
 def test_get_stats():
     memory_module.add_message("s1", "nexus", "user", "a")
     memory_module.add_message("s2", "forge", "user", "b")
