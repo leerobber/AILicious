@@ -29,8 +29,12 @@ def _reset_rate_limit_state():
     reset_rate_limit()
 
 
+scheduled_digest_agents: list[str] = []
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
+    from core import digest as digest_module
     from core import memory as memory_module
     from core import persona_overrides as persona_overrides_module
     from core import sage_proposals as sage_proposals_module
@@ -39,9 +43,21 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(memory_module, "DB_PATH", db_path)
     monkeypatch.setattr(persona_overrides_module, "DB_PATH", db_path)
     monkeypatch.setattr(sage_proposals_module, "DB_PATH", db_path)
+    monkeypatch.setattr(digest_module, "DB_PATH", db_path)
+    digest_module._active_agents.clear()
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
     sent_requests.clear()
     monkeypatch.setattr(f"{__name__}.mock_reply_content", "mocked reply")
+
+    import main as main_module
+
+    # Digestion is fire-and-forget (asyncio.create_task); racing that against a
+    # synchronous TestClient request is exactly the kind of flakiness that pattern
+    # is supposed to avoid. Tests that care about scheduling assert against this
+    # recorder instead; tests that need real digest content call core.digest
+    # directly (see test_digest.py) rather than relying on background timing here.
+    scheduled_digest_agents.clear()
+    monkeypatch.setattr(main_module, "_schedule_digest", scheduled_digest_agents.append)
 
     with TestClient(app) as c:
         yield c
@@ -201,16 +217,21 @@ def test_sage_analyze_unknown_agent_is_404(client):
     assert resp.status_code == 404
 
 
-def test_sage_analyze_with_no_feedback_is_400(client):
+def test_sage_analyze_with_no_digest_is_400(client):
     resp = client.post("/sage/analyze/nexus", headers={"X-API-Key": VALID_KEY})
     assert resp.status_code == 400
+
+
+def _seed_digest(agent: str, text: str = "User prefers concise, direct answers.") -> None:
+    from core import digest as digest_module
+
+    digest_module.apply_digest(agent, text, topic_shift=False)
 
 
 def test_sage_analyze_creates_pending_proposal(client, monkeypatch):
     test_api_module = sys.modules[__name__]
 
-    message_id = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}).json()["message_id"]
-    client.post("/feedback", headers={"X-API-Key": VALID_KEY}, json={"message_id": message_id, "rating": 1})
+    _seed_digest("nexus")
 
     monkeypatch.setattr(
         test_api_module,
@@ -233,8 +254,7 @@ def test_sage_analyze_creates_pending_proposal(client, monkeypatch):
 def test_sage_analyze_malformed_llm_response_is_502(client, monkeypatch):
     test_api_module = sys.modules[__name__]
 
-    message_id = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}).json()["message_id"]
-    client.post("/feedback", headers={"X-API-Key": VALID_KEY}, json={"message_id": message_id, "rating": 1})
+    _seed_digest("nexus")
 
     monkeypatch.setattr(test_api_module, "mock_reply_content", "this is not JSON at all")
 
@@ -263,8 +283,7 @@ def test_sage_reject_proposal_unknown_id_is_404(client):
 def test_sage_accept_proposal_applies_override_and_changes_outgoing_system_prompt(client, monkeypatch):
     test_api_module = sys.modules[__name__]
 
-    message_id = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}).json()["message_id"]
-    client.post("/feedback", headers={"X-API-Key": VALID_KEY}, json={"message_id": message_id, "rating": 1})
+    _seed_digest("nexus")
 
     monkeypatch.setattr(
         test_api_module,
@@ -289,8 +308,7 @@ def test_sage_accept_proposal_applies_override_and_changes_outgoing_system_promp
 def test_sage_reject_proposal_does_not_apply_override(client, monkeypatch):
     test_api_module = sys.modules[__name__]
 
-    message_id = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}).json()["message_id"]
-    client.post("/feedback", headers={"X-API-Key": VALID_KEY}, json={"message_id": message_id, "rating": -1})
+    _seed_digest("nexus")
 
     monkeypatch.setattr(
         test_api_module,
@@ -312,8 +330,7 @@ def test_sage_reject_proposal_does_not_apply_override(client, monkeypatch):
 def test_sage_accept_already_reviewed_proposal_is_409(client, monkeypatch):
     test_api_module = sys.modules[__name__]
 
-    message_id = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}).json()["message_id"]
-    client.post("/feedback", headers={"X-API-Key": VALID_KEY}, json={"message_id": message_id, "rating": 1})
+    _seed_digest("nexus")
 
     monkeypatch.setattr(
         test_api_module, "mock_reply_content", json.dumps({"rationale": "r", "proposed_system_prompt": "p"})
@@ -323,6 +340,41 @@ def test_sage_accept_already_reviewed_proposal_is_409(client, monkeypatch):
     client.post(f"/sage/proposals/{proposal_id}/accept", headers={"X-API-Key": VALID_KEY})
     resp = client.post(f"/sage/proposals/{proposal_id}/reject", headers={"X-API-Key": VALID_KEY})
     assert resp.status_code == 409
+
+
+def test_chat_without_digest_sends_only_persona_system_prompt(client):
+    client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+
+    system_messages = [m for m in sent_requests[-1]["messages"] if m["role"] == "system"]
+    assert len(system_messages) == 1  # just the persona prompt, no digest block yet
+
+
+def test_chat_with_digest_injects_it_as_extra_context(client):
+    _seed_digest("nexus", "User's name is Alex and they prefer short answers.")
+
+    client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+
+    system_messages = [m for m in sent_requests[-1]["messages"] if m["role"] == "system"]
+    assert len(system_messages) == 2
+    assert "User's name is Alex and they prefer short answers." in system_messages[1]["content"]
+
+
+def test_chat_does_not_schedule_digest_before_threshold(client):
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+    assert resp.status_code == 200
+    assert scheduled_digest_agents == []
+
+
+def test_chat_schedules_digest_once_threshold_crossed(client, monkeypatch):
+    from core import digest as digest_module
+
+    monkeypatch.setattr(digest_module, "MESSAGE_TRIGGER", 4)  # 2 exchanges = 4 turns
+
+    client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "one"})
+    assert scheduled_digest_agents == []
+
+    client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "two"})
+    assert scheduled_digest_agents == ["nexus"]
 
 
 def test_cross_agent_memory_does_not_leak(client):

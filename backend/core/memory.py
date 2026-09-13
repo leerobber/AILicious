@@ -6,22 +6,6 @@ from core.db import get_connection as _db_get_connection
 
 _lock = threading.Lock()
 
-# KAIROS: utility-weighted retrieval. A message's stored utility_score combines a small
-# write-time heuristic (longer, more substantive turns score slightly higher) with any
-# feedback adjustment. get_history() uses it to let a genuinely valuable older message
-# survive over worthless-but-recent filler, without abandoning "prefer recent" as the
-# default — when every candidate has utility_score == 0 (no feedback yet), ranking
-# collapses to pure recency, identical to a plain `ORDER BY id DESC LIMIT`.
-CANDIDATE_LIMIT = 60
-UTILITY_WEIGHT = 10.0
-HEURISTIC_LENGTH_CAP = 200
-HEURISTIC_MAX = 0.5
-FEEDBACK_WEIGHT = 2.0
-
-
-def _heuristic_score(content: str) -> float:
-    return min(len(content) / HEURISTIC_LENGTH_CAP, 1.0) * HEURISTIC_MAX
-
 
 def _get_connection():
     return _db_get_connection(DB_PATH, TURSO_DATABASE_URL, TURSO_AUTH_TOKEN)
@@ -52,6 +36,11 @@ def init_db() -> None:
             except ValueError:
                 pass  # column already exists (fresh table, or already migrated)
             try:
+                # Historical: fed KAIROS's per-message utility ranking, since replaced by
+                # core/digest.py's whole-conversation summarization. Left in place rather
+                # than dropped -- libsql/SQLite don't support a clean column drop, and
+                # forcing a table rebuild against the live Turso DB isn't worth the risk
+                # for a column that's simply unused going forward.
                 conn.execute("ALTER TABLE messages ADD COLUMN utility_score REAL NOT NULL DEFAULT 0.0")
             except ValueError:
                 pass  # column already exists (fresh table, or already migrated)
@@ -66,9 +55,8 @@ def add_message(session_id: str, agent: str, role: str, content: str) -> int:
         conn = _get_connection()
         try:
             cursor = conn.execute(
-                "INSERT INTO messages (session_id, agent, role, content, created_at, utility_score) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (session_id, agent, role, content, datetime.now(timezone.utc).isoformat(), _heuristic_score(content)),
+                "INSERT INTO messages (session_id, agent, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (session_id, agent, role, content, datetime.now(timezone.utc).isoformat()),
             )
             message_id = cursor.lastrowid
             conn.commit()
@@ -78,29 +66,20 @@ def add_message(session_id: str, agent: str, role: str, content: str) -> int:
 
 
 def set_feedback(message_id: int, rating: int) -> bool:
-    """Record feedback on a message and adjust its utility_score accordingly.
+    """Record a thumbs up/down on a message.
 
-    Idempotent with respect to re-voting or switching a vote: the score adjustment is
-    computed from the *change* between the previous and new feedback, not appended
-    blindly, so voting the same way twice (or flipping a vote) never double-counts.
-    Returns False if no message with that id exists.
+    Optional: neither context selection nor SAGE's persona analysis depend on this
+    anymore (both run from the conversation digest in core/digest.py), but a flagged
+    message is folded into the next digest cycle as extra-weighted signal. Returns
+    False if no message with that id exists.
     """
     with _lock:
         conn = _get_connection()
         try:
-            row = conn.execute("SELECT feedback FROM messages WHERE id = ?", (message_id,)).fetchone()
+            row = conn.execute("SELECT id FROM messages WHERE id = ?", (message_id,)).fetchone()
             if row is None:
                 return False
-
-            old_feedback = row[0]
-            old_delta = FEEDBACK_WEIGHT * old_feedback if old_feedback in (1, -1) else 0.0
-            new_delta = FEEDBACK_WEIGHT * rating
-            adjustment = new_delta - old_delta
-
-            conn.execute(
-                "UPDATE messages SET feedback = ?, utility_score = utility_score + ? WHERE id = ?",
-                (rating, adjustment, message_id),
-            )
+            conn.execute("UPDATE messages SET feedback = ? WHERE id = ?", (rating, message_id))
             conn.commit()
         finally:
             conn.close()
@@ -108,66 +87,46 @@ def set_feedback(message_id: int, rating: int) -> bool:
 
 
 def get_history(session_id: str, agent: str, limit: int = 20) -> list[dict]:
-    with _lock:
-        conn = _get_connection()
-        try:
-            rows = conn.execute(
-                "SELECT id, role, content, utility_score FROM messages "
-                "WHERE session_id = ? AND agent = ? ORDER BY id DESC LIMIT ?",
-                (session_id, agent, CANDIDATE_LIMIT),
-            ).fetchall()
-        finally:
-            conn.close()
-
-    # rows[0] is the most recent candidate. recency_score decreases monotonically with
-    # age; when every utility_score is 0 (the common case, no feedback yet), the ranking
-    # below is identical to plain recency — same rows a bare LIMIT would return.
-    pool_size = len(rows)
-    scored = [
-        (pool_size - i + utility_score * UTILITY_WEIGHT, msg_id, role, content)
-        for i, (msg_id, role, content, utility_score) in enumerate(rows)
-    ]
-
-    top = sorted(scored, key=lambda item: item[0], reverse=True)[:limit]
-    top.sort(key=lambda item: item[1])  # back to chronological order for the transcript
-
-    return [{"role": role, "content": content} for _, _, role, content in top]
-
-
-def get_feedback_examples(agent: str, limit: int = 50) -> list[dict]:
-    """Return recent feedback'd exchanges for an agent, most recent first.
-
-    Each entry pairs an assistant reply that received a thumbs up/down with the user
-    message that prompted it, for SAGE to use as evidence when proposing a persona
-    revision. Agents with no feedback yet return an empty list.
+    """Plain recency window for one conversation -- the short raw tail appended after
+    the agent's conversation digest (core/digest.py) when building chat context. The
+    digest carries the bulk of long-range memory now, so this only needs to cover the
+    last few turns.
     """
     with _lock:
         conn = _get_connection()
         try:
-            assistant_rows = conn.execute(
-                "SELECT id, content, feedback FROM messages "
-                "WHERE agent = ? AND role = 'assistant' AND feedback IS NOT NULL "
-                "ORDER BY id DESC LIMIT ?",
-                (agent, limit),
+            rows = conn.execute(
+                "SELECT role, content FROM messages WHERE session_id = ? AND agent = ? ORDER BY id DESC LIMIT ?",
+                (session_id, agent, limit),
             ).fetchall()
-
-            examples = []
-            for assistant_id, assistant_content, feedback in assistant_rows:
-                user_row = conn.execute(
-                    "SELECT content FROM messages WHERE agent = ? AND role = 'user' AND id < ? "
-                    "ORDER BY id DESC LIMIT 1",
-                    (agent, assistant_id),
-                ).fetchone()
-                examples.append(
-                    {
-                        "user_message": user_row[0] if user_row else None,
-                        "assistant_reply": assistant_content,
-                        "feedback": feedback,
-                    }
-                )
         finally:
             conn.close()
-    return examples
+    return [{"role": role, "content": content} for role, content in reversed(rows)]
+
+
+def get_messages_since(agent: str, since: str | None) -> list[dict]:
+    """All raw messages for this agent across every session, oldest first, created
+    after the given ISO timestamp -- the new-turns slice a digest cycle folds into
+    the agent's running summary. `since=None` means "everything" (an agent's first
+    ever digest cycle, before any digest exists).
+    """
+    with _lock:
+        conn = _get_connection()
+        try:
+            if since:
+                rows = conn.execute(
+                    "SELECT role, content, feedback FROM messages WHERE agent = ? AND created_at > ? "
+                    "ORDER BY id ASC",
+                    (agent, since),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT role, content, feedback FROM messages WHERE agent = ? ORDER BY id ASC",
+                    (agent,),
+                ).fetchall()
+        finally:
+            conn.close()
+    return [{"role": role, "content": content, "feedback": feedback} for role, content, feedback in rows]
 
 
 def get_stats() -> dict:
