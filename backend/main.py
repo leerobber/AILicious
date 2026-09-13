@@ -5,18 +5,21 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from core.memory import add_message, get_history, get_stats, init_db
 from core.persona import get_system_prompt, has_persona, list_personas, load_personas
+from core.ratelimit import check_rate_limit
 
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 MISTRAL_MODEL = os.environ.get("MISTRAL_MODEL", "mistral-small-latest")
 APP_API_KEY = os.environ.get("APP_API_KEY")
 HISTORY_LIMIT = 20
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "20"))
+MAX_MESSAGE_LENGTH = int(os.environ.get("MAX_MESSAGE_LENGTH", "4000"))
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
@@ -46,9 +49,25 @@ def require_api_key(x_api_key: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+def enforce_rate_limit(identifier: str) -> None:
+    allowed, retry_after = check_rate_limit(identifier, RATE_LIMIT_PER_MINUTE)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: max {RATE_LIMIT_PER_MINUTE} requests per minute. Try again shortly.",
+            headers={"Retry-After": str(int(retry_after) + 1)},
+        )
+
+
 async def run_agent_chat(agent: str, message: str, session_id: str | None) -> ChatResponse:
     if not MISTRAL_API_KEY:
         raise HTTPException(status_code=500, detail="MISTRAL_API_KEY is not configured on the server")
+
+    if len(message) > MAX_MESSAGE_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Message too long ({len(message)} chars, max {MAX_MESSAGE_LENGTH}).",
+        )
 
     session_id = session_id or str(uuid.uuid4())
 
@@ -97,14 +116,18 @@ async def memory_stats(x_api_key: str | None = Header(default=None)) -> dict:
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, x_api_key: str | None = Header(default=None)) -> ChatResponse:
+async def chat(req: ChatRequest, request: Request, x_api_key: str | None = Header(default=None)) -> ChatResponse:
     require_api_key(x_api_key)
+    enforce_rate_limit(x_api_key or (request.client.host if request.client else "unknown"))
     return await run_agent_chat("nexus", req.message, req.session_id)
 
 
 @app.post("/agents/{name}", response_model=ChatResponse)
-async def chat_with_agent(name: str, req: ChatRequest, x_api_key: str | None = Header(default=None)) -> ChatResponse:
+async def chat_with_agent(
+    name: str, req: ChatRequest, request: Request, x_api_key: str | None = Header(default=None)
+) -> ChatResponse:
     require_api_key(x_api_key)
+    enforce_rate_limit(x_api_key or (request.client.host if request.client else "unknown"))
     if not has_persona(name):
         raise HTTPException(status_code=404, detail=f"Unknown agent '{name}'. Available: {list_personas()}")
     return await run_agent_chat(name, req.message, req.session_id)

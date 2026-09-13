@@ -21,6 +21,8 @@ A FastAPI service that proxies chat messages to Mistral, with SQLite-compatible 
 
 Both chat endpoints accept an optional `session_id`; when included, the last 20 messages for that `(session_id, agent)` pair are sent back to Mistral as context. **Memory is scoped per agent, not just per session** — reusing the same `session_id` across different agents does not leak one agent's conversation into another's; each keeps its own thread of history even under a shared session. Persona text lives in `backend/config/personas/*.yaml` — edit those files to change how an agent talks, no code changes needed.
 
+Both chat endpoints are also rate-limited (default 20 requests/minute, per API key — or per client IP locally if `APP_API_KEY` is unset) and cap message length (default 4000 characters), to keep a leaked key or a client bug from running up unbounded Mistral usage. Tune via `RATE_LIMIT_PER_MINUTE` and `MAX_MESSAGE_LENGTH`; exceeding either returns a normal error the PWA already displays inline (429 with a `Retry-After` header, or 400).
+
 ### Run locally
 
 ```bash
@@ -80,4 +82,4 @@ To set it up:
 
 ### Next steps
 
-The original plan's phases are now all in place: cloud backend, remote inference, durable memory, personas, full agent swarm, and the Android/web client. From here it's iteration — the KAIROS/SAGE self-improvement loops, and hardening (rate limiting, real auth beyond a shared API key) as this gets used for real.
+The original plan's phases are now all in place: cloud backend, remote inference, durable memory, personas, full agent swarm, the Android/web client, and basic hardening (rate limiting, message-length caps). What's left is the KAIROS/SAGE self-improvement loops from the original blueprint — a design task before it's a coding task — and eventually real per-user auth if this is ever used by more than one person, rather than a single shared API key.

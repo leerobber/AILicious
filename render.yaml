@@ -13,6 +13,10 @@ services:
         value: mistral-small-latest
       - key: APP_API_KEY
         sync: false
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "20"
+      - key: MAX_MESSAGE_LENGTH
+        value: "4000"
       - key: TURSO_DATABASE_URL
         sync: false
       - key: TURSO_AUTH_TOKEN
