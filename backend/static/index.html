@@ -204,13 +204,22 @@
   <dialog id="settings">
     <h2>Settings</h2>
     <label for="api-key">API key</label>
-    <input type="password" id="api-key" placeholder="X-API-Key for this backend" autocomplete="off" />
+    <input
+      type="password"
+      id="api-key"
+      placeholder="X-API-Key for this backend"
+      autocomplete="off"
+      autocapitalize="off"
+      autocorrect="off"
+      spellcheck="false"
+    />
+    <div id="key-status" style="font-size: 13px; margin: -10px 0 16px; min-height: 16px;"></div>
     <div class="row">
       <button type="button" class="danger" id="clear-history">Clear this agent's chat</button>
     </div>
     <div class="row" style="margin-top: 12px;">
       <button type="button" class="cancel" id="settings-cancel">Cancel</button>
-      <button type="button" class="save" id="settings-save">Save</button>
+      <button type="button" class="save" id="settings-save">Save &amp; test</button>
     </div>
   </dialog>
 
@@ -236,11 +245,11 @@
     }
 
     function getApiKey() {
-      return localStorage.getItem("ailicious_api_key") || "";
+      return (localStorage.getItem("ailicious_api_key") || "").trim();
     }
 
     function setApiKey(key) {
-      localStorage.setItem("ailicious_api_key", key);
+      localStorage.setItem("ailicious_api_key", key.trim());
     }
 
     function getSessionId(agent) {
@@ -307,16 +316,43 @@
       renderHistory(currentAgent());
     });
 
+    const keyStatusEl = document.getElementById("key-status");
+
+    function setKeyStatus(text, color) {
+      keyStatusEl.textContent = text;
+      keyStatusEl.style.color = color;
+    }
+
     settingsBtn.addEventListener("click", () => {
       apiKeyInput.value = getApiKey();
+      setKeyStatus("", "");
       settingsDialog.showModal();
     });
 
     settingsCancel.addEventListener("click", () => settingsDialog.close());
 
-    settingsSave.addEventListener("click", () => {
-      setApiKey(apiKeyInput.value.trim());
-      settingsDialog.close();
+    settingsSave.addEventListener("click", async () => {
+      const key = apiKeyInput.value.trim();
+      setApiKey(key);
+
+      settingsSave.disabled = true;
+      setKeyStatus("Testing key…", "var(--text-dim)");
+
+      try {
+        const resp = await fetch(`${API_BASE}/agents`, { headers: { "X-API-Key": key } });
+        if (resp.ok) {
+          setKeyStatus("✓ Key works — saved.", "#4ade80");
+          setTimeout(() => settingsDialog.close(), 700);
+        } else if (resp.status === 401) {
+          setKeyStatus("✗ Server rejected this key (401). Check for typos or extra spaces.", "var(--error)");
+        } else {
+          setKeyStatus(`✗ Unexpected response (${resp.status}). Saved anyway.`, "var(--error)");
+        }
+      } catch (err) {
+        setKeyStatus(`✗ Couldn't reach the server: ${err.message}`, "var(--error)");
+      } finally {
+        settingsSave.disabled = false;
+      }
     });
 
     clearHistoryBtn.addEventListener("click", () => {
