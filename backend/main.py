@@ -11,7 +11,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from core.digest import get_digest_text, note_turns, run_digest_cycle, should_digest
+from core.digest import get_digest_text, get_state as get_digest_state, note_turns, run_digest_cycle, should_digest
 from core.digest import init_db as init_digest_db
 from core.memory import add_message, get_history, get_stats, init_db, set_feedback
 from core.persona import get_system_prompt, has_persona, list_personas, load_personas
@@ -266,24 +266,32 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
 
 SAGE_ANALYSIS_SYSTEM_PROMPT = (
     "You are SAGE, a persona-tuning assistant for an AI agent platform. You will be shown an "
-    "agent's current system prompt and a synthesized summary of what the agent has learned "
-    "about its user across every conversation -- their goals, preferences, corrections "
-    "they've made, and recurring patterns. Propose a revised system prompt that better serves "
-    "this user based on that summary, while preserving the agent's core identity and role. "
+    "agent's current system prompt, a synthesized summary of what the agent has learned about "
+    "its user across every conversation, and a separate read on what this user implicitly "
+    "responds well or poorly to -- inferred from their behavior (rephrasing, corrections, "
+    "reuse, affirmations), not from explicit ratings. Weight that signal-quality read as your "
+    "primary evidence for what to change; the summary is context, not a mandate to cover every "
+    "topic discussed. Propose a revised system prompt that better serves this user based on "
+    "that signal, while preserving the agent's core identity and role. If the signal read is "
+    "empty or uninformative, say so in the rationale and propose only a minimal, low-risk "
+    "change rather than inventing a rewrite from topic content alone. "
     "Respond with ONLY a JSON object of the form "
-    '{"rationale": "<one paragraph explaining the change>", '
+    '{"rationale": "<one paragraph explaining the change, or why little should change>", '
     '"proposed_system_prompt": "<the full revised system prompt>"}. '
     "No markdown, no code fences, no extra text — valid JSON only."
 )
 
 
-def _build_sage_analysis_messages(agent: str, current_system_prompt: str, digest: str) -> list[dict]:
+def _build_sage_analysis_messages(agent: str, current_system_prompt: str, digest: str, signal_quality: str) -> list[dict]:
     lines = [
         f"Current system prompt for '{agent}':",
         current_system_prompt,
         "",
         "What this agent has learned about its user, synthesized from every conversation:",
         digest,
+        "",
+        "What this user implicitly responds well or poorly to (inferred from behavior, not ratings):",
+        signal_quality or "(no informative signal yet)",
     ]
     return [
         {"role": "system", "content": SAGE_ANALYSIS_SYSTEM_PROMPT},
@@ -364,16 +372,25 @@ async def sage_analyze(agent: str, x_api_key: str | None = Header(default=None))
     if not has_persona(agent):
         raise HTTPException(status_code=404, detail=f"Unknown agent '{agent}'. Available: {list_personas()}")
 
-    digest_text = await asyncio.to_thread(get_digest_text, agent)
-    if not digest_text:
+    state = await asyncio.to_thread(get_digest_state, agent)
+    if not state["digest"]:
         raise HTTPException(
             status_code=400, detail=f"No conversation digest yet for agent '{agent}' -- chat with it a bit first."
+        )
+    if not state["signal_quality"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No read yet on what works or doesn't for '{agent}' -- nothing in the conversation so far "
+                "gave an implicit signal (a rephrased question, a correction, reusing an answer, an "
+                "affirmation). Keep chatting naturally and this fills in on its own."
+            ),
         )
 
     override = await asyncio.to_thread(get_override, agent)
     current_system_prompt = override if override is not None else get_system_prompt(agent)
 
-    messages = _build_sage_analysis_messages(agent, current_system_prompt, digest_text)
+    messages = _build_sage_analysis_messages(agent, current_system_prompt, state["digest"], state["signal_quality"])
     raw_reply = await _call_mistral(messages)
 
     try:

@@ -222,10 +222,23 @@ def test_sage_analyze_with_no_digest_is_400(client):
     assert resp.status_code == 400
 
 
-def _seed_digest(agent: str, text: str = "User prefers concise, direct answers.") -> None:
+def test_sage_analyze_with_digest_but_no_signal_quality_is_400(client):
     from core import digest as digest_module
 
-    digest_module.apply_digest(agent, text, topic_shift=False)
+    digest_module.apply_digest("nexus", "some digest", topic_shift=False)  # no signal_quality
+
+    resp = client.post("/sage/analyze/nexus", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 400
+
+
+def _seed_digest(
+    agent: str,
+    text: str = "User prefers concise, direct answers.",
+    signal_quality: str = "Rephrases when answers are too long; affirms short, direct ones.",
+) -> None:
+    from core import digest as digest_module
+
+    digest_module.apply_digest(agent, text, topic_shift=False, signal_quality=signal_quality)
 
 
 def test_sage_analyze_creates_pending_proposal(client, monkeypatch):
