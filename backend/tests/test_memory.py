@@ -100,6 +100,49 @@ def test_zero_utility_history_matches_plain_recency():
     assert contents == [f"msg{i}" for i in range(5, 25)]
 
 
+def test_get_feedback_examples_returns_empty_list_when_no_feedback():
+    memory_module.add_message("s1", "nexus", "user", "hello")
+    memory_module.add_message("s1", "nexus", "assistant", "hi there")
+
+    assert memory_module.get_feedback_examples("nexus") == []
+
+
+def test_get_feedback_examples_pairs_user_and_assistant_messages():
+    memory_module.add_message("s1", "nexus", "user", "what's the weather?")
+    assistant_id = memory_module.add_message("s1", "nexus", "assistant", "sunny and warm")
+    memory_module.set_feedback(assistant_id, 1)
+
+    examples = memory_module.get_feedback_examples("nexus")
+
+    assert examples == [{"user_message": "what's the weather?", "assistant_reply": "sunny and warm", "feedback": 1}]
+
+
+def test_get_feedback_examples_only_includes_feedback_messages_most_recent_first():
+    memory_module.add_message("s1", "nexus", "user", "q1")
+    id1 = memory_module.add_message("s1", "nexus", "assistant", "a1")
+    memory_module.add_message("s1", "nexus", "user", "q2")
+    id2 = memory_module.add_message("s1", "nexus", "assistant", "a2")
+    memory_module.add_message("s1", "nexus", "user", "q3")
+    memory_module.add_message("s1", "nexus", "assistant", "a3")  # no feedback, excluded
+
+    memory_module.set_feedback(id1, -1)
+    memory_module.set_feedback(id2, 1)
+
+    examples = memory_module.get_feedback_examples("nexus")
+
+    assert [e["assistant_reply"] for e in examples] == ["a2", "a1"]
+    assert [e["feedback"] for e in examples] == [1, -1]
+
+
+def test_get_feedback_examples_scoped_per_agent():
+    memory_module.add_message("s1", "forge", "user", "q")
+    forge_reply_id = memory_module.add_message("s1", "forge", "assistant", "forge reply")
+    memory_module.set_feedback(forge_reply_id, 1)
+
+    assert memory_module.get_feedback_examples("oracle") == []
+    assert len(memory_module.get_feedback_examples("forge")) == 1
+
+
 def test_get_stats():
     memory_module.add_message("s1", "nexus", "user", "a")
     memory_module.add_message("s2", "forge", "user", "b")

@@ -134,6 +134,42 @@ def get_history(session_id: str, agent: str, limit: int = 20) -> list[dict]:
     return [{"role": role, "content": content} for _, _, role, content in top]
 
 
+def get_feedback_examples(agent: str, limit: int = 50) -> list[dict]:
+    """Return recent feedback'd exchanges for an agent, most recent first.
+
+    Each entry pairs an assistant reply that received a thumbs up/down with the user
+    message that prompted it, for SAGE to use as evidence when proposing a persona
+    revision. Agents with no feedback yet return an empty list.
+    """
+    with _lock:
+        conn = _get_connection()
+        try:
+            assistant_rows = conn.execute(
+                "SELECT id, content, feedback FROM messages "
+                "WHERE agent = ? AND role = 'assistant' AND feedback IS NOT NULL "
+                "ORDER BY id DESC LIMIT ?",
+                (agent, limit),
+            ).fetchall()
+
+            examples = []
+            for assistant_id, assistant_content, feedback in assistant_rows:
+                user_row = conn.execute(
+                    "SELECT content FROM messages WHERE agent = ? AND role = 'user' AND id < ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (agent, assistant_id),
+                ).fetchone()
+                examples.append(
+                    {
+                        "user_message": user_row[0] if user_row else None,
+                        "assistant_reply": assistant_content,
+                        "feedback": feedback,
+                    }
+                )
+        finally:
+            conn.close()
+    return examples
+
+
 def get_stats() -> dict:
     with _lock:
         conn = _get_connection()

@@ -1,3 +1,6 @@
+import json
+import sys
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -7,13 +10,14 @@ from main import app
 
 VALID_KEY = "test-app-key"
 sent_requests: list[dict] = []
+mock_reply_content = "mocked reply"
 
 
 async def _fake_post(self, url, json=None, headers=None, **kwargs):
     sent_requests.append(json)
     return httpx.Response(
         200,
-        json={"choices": [{"message": {"content": "mocked reply"}}]},
+        json={"choices": [{"message": {"content": mock_reply_content}}]},
         request=httpx.Request("POST", url),
     )
 
@@ -29,12 +33,15 @@ def _reset_rate_limit_state():
 def client(tmp_path, monkeypatch):
     from core import memory as memory_module
     from core import persona_overrides as persona_overrides_module
+    from core import sage_proposals as sage_proposals_module
 
     db_path = tmp_path / "api_test.db"
     monkeypatch.setattr(memory_module, "DB_PATH", db_path)
     monkeypatch.setattr(persona_overrides_module, "DB_PATH", db_path)
+    monkeypatch.setattr(sage_proposals_module, "DB_PATH", db_path)
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
     sent_requests.clear()
+    monkeypatch.setattr(f"{__name__}.mock_reply_content", "mocked reply")
 
     with TestClient(app) as c:
         yield c
@@ -182,6 +189,140 @@ def test_sage_reset_reverts_to_default_persona(client):
 
     outgoing_system_message = sent_requests[-1]["messages"][0]
     assert outgoing_system_message["content"] != "You are a pirate."
+
+
+def test_sage_analyze_requires_api_key(client):
+    resp = client.post("/sage/analyze/nexus")
+    assert resp.status_code == 401
+
+
+def test_sage_analyze_unknown_agent_is_404(client):
+    resp = client.post("/sage/analyze/doesnotexist", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 404
+
+
+def test_sage_analyze_with_no_feedback_is_400(client):
+    resp = client.post("/sage/analyze/nexus", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 400
+
+
+def test_sage_analyze_creates_pending_proposal(client, monkeypatch):
+    test_api_module = sys.modules[__name__]
+
+    message_id = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}).json()["message_id"]
+    client.post("/feedback", headers={"X-API-Key": VALID_KEY}, json={"message_id": message_id, "rating": 1})
+
+    monkeypatch.setattr(
+        test_api_module,
+        "mock_reply_content",
+        json.dumps({"rationale": "users liked warmth", "proposed_system_prompt": "Be warm and friendly."}),
+    )
+
+    resp = client.post("/sage/analyze/nexus", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body["rationale"] == "users liked warmth"
+    assert body["proposed_system_prompt"] == "Be warm and friendly."
+
+    proposals = client.get("/sage/proposals", headers={"X-API-Key": VALID_KEY}).json()["proposals"]
+    assert len(proposals) == 1
+    assert proposals[0]["id"] == body["id"]
+
+
+def test_sage_analyze_malformed_llm_response_is_502(client, monkeypatch):
+    test_api_module = sys.modules[__name__]
+
+    message_id = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}).json()["message_id"]
+    client.post("/feedback", headers={"X-API-Key": VALID_KEY}, json={"message_id": message_id, "rating": 1})
+
+    monkeypatch.setattr(test_api_module, "mock_reply_content", "this is not JSON at all")
+
+    resp = client.post("/sage/analyze/nexus", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 502
+
+    proposals = client.get("/sage/proposals", headers={"X-API-Key": VALID_KEY}).json()["proposals"]
+    assert proposals == []
+
+
+def test_sage_proposals_requires_api_key(client):
+    resp = client.get("/sage/proposals")
+    assert resp.status_code == 401
+
+
+def test_sage_accept_proposal_unknown_id_is_404(client):
+    resp = client.post("/sage/proposals/999999/accept", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 404
+
+
+def test_sage_reject_proposal_unknown_id_is_404(client):
+    resp = client.post("/sage/proposals/999999/reject", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 404
+
+
+def test_sage_accept_proposal_applies_override_and_changes_outgoing_system_prompt(client, monkeypatch):
+    test_api_module = sys.modules[__name__]
+
+    message_id = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}).json()["message_id"]
+    client.post("/feedback", headers={"X-API-Key": VALID_KEY}, json={"message_id": message_id, "rating": 1})
+
+    monkeypatch.setattr(
+        test_api_module,
+        "mock_reply_content",
+        json.dumps({"rationale": "r", "proposed_system_prompt": "You are now extremely concise."}),
+    )
+    proposal_id = client.post("/sage/analyze/nexus", headers={"X-API-Key": VALID_KEY}).json()["id"]
+
+    monkeypatch.setattr(test_api_module, "mock_reply_content", "mocked reply")
+    accept_resp = client.post(f"/sage/proposals/{proposal_id}/accept", headers={"X-API-Key": VALID_KEY})
+    assert accept_resp.status_code == 200
+    assert accept_resp.json()["status"] == "accepted"
+
+    proposal = client.get("/sage/proposals", headers={"X-API-Key": VALID_KEY}).json()["proposals"][0]
+    assert proposal["status"] == "accepted"
+
+    client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi again"})
+    outgoing_system_message = sent_requests[-1]["messages"][0]
+    assert outgoing_system_message["content"] == "You are now extremely concise."
+
+
+def test_sage_reject_proposal_does_not_apply_override(client, monkeypatch):
+    test_api_module = sys.modules[__name__]
+
+    message_id = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}).json()["message_id"]
+    client.post("/feedback", headers={"X-API-Key": VALID_KEY}, json={"message_id": message_id, "rating": -1})
+
+    monkeypatch.setattr(
+        test_api_module,
+        "mock_reply_content",
+        json.dumps({"rationale": "r", "proposed_system_prompt": "You are now extremely concise."}),
+    )
+    proposal_id = client.post("/sage/analyze/nexus", headers={"X-API-Key": VALID_KEY}).json()["id"]
+
+    monkeypatch.setattr(test_api_module, "mock_reply_content", "mocked reply")
+    reject_resp = client.post(f"/sage/proposals/{proposal_id}/reject", headers={"X-API-Key": VALID_KEY})
+    assert reject_resp.status_code == 200
+    assert reject_resp.json()["status"] == "rejected"
+
+    client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi again"})
+    outgoing_system_message = sent_requests[-1]["messages"][0]
+    assert outgoing_system_message["content"] != "You are now extremely concise."
+
+
+def test_sage_accept_already_reviewed_proposal_is_409(client, monkeypatch):
+    test_api_module = sys.modules[__name__]
+
+    message_id = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}).json()["message_id"]
+    client.post("/feedback", headers={"X-API-Key": VALID_KEY}, json={"message_id": message_id, "rating": 1})
+
+    monkeypatch.setattr(
+        test_api_module, "mock_reply_content", json.dumps({"rationale": "r", "proposed_system_prompt": "p"})
+    )
+    proposal_id = client.post("/sage/analyze/nexus", headers={"X-API-Key": VALID_KEY}).json()["id"]
+
+    client.post(f"/sage/proposals/{proposal_id}/accept", headers={"X-API-Key": VALID_KEY})
+    resp = client.post(f"/sage/proposals/{proposal_id}/reject", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 409
 
 
 def test_cross_agent_memory_does_not_leak(client):
