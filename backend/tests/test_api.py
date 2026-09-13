@@ -79,6 +79,35 @@ def test_agents_route_unknown_agent_is_404(client):
     assert resp.status_code == 404
 
 
+def test_chat_response_includes_message_id(client):
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+    assert isinstance(resp.json()["message_id"], int)
+
+
+def test_feedback_accepts_valid_rating(client):
+    message_id = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}).json()["message_id"]
+
+    resp = client.post("/feedback", headers={"X-API-Key": VALID_KEY}, json={"message_id": message_id, "rating": 1})
+    assert resp.status_code == 200
+
+
+def test_feedback_invalid_rating_is_400(client):
+    message_id = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}).json()["message_id"]
+
+    resp = client.post("/feedback", headers={"X-API-Key": VALID_KEY}, json={"message_id": message_id, "rating": 5})
+    assert resp.status_code == 400
+
+
+def test_feedback_unknown_message_id_is_404(client):
+    resp = client.post("/feedback", headers={"X-API-Key": VALID_KEY}, json={"message_id": 999999, "rating": 1})
+    assert resp.status_code == 404
+
+
+def test_feedback_requires_api_key(client):
+    resp = client.post("/feedback", json={"message_id": 1, "rating": 1})
+    assert resp.status_code == 401
+
+
 def test_message_over_length_cap_is_400(client, monkeypatch):
     import main as main_module
 

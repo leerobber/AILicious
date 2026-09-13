@@ -192,6 +192,34 @@
     border-radius: 12px;
     font-size: 13.5px;
   }
+  .bubble-col {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+  .feedback-row {
+    display: flex;
+    gap: 4px;
+    padding-left: 2px;
+  }
+  .fb-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    padding: 3px;
+    border-radius: 6px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+  }
+  .fb-btn svg { width: 14px; height: 14px; }
+  .fb-btn:hover:not(:disabled) { background: var(--panel-2); color: var(--text); }
+  .fb-btn.active { color: var(--agent-accent); }
+  .fb-btn:disabled { cursor: default; }
+  .fb-btn:disabled:not(.active) { opacity: 0.35; }
+
   .msg.pending { color: var(--text-dim); }
   .pending-dots span {
     display: inline-block;
@@ -437,7 +465,71 @@
       document.documentElement.style.setProperty("--agent-accent", color);
     }
 
-    function renderMessage(role, content) {
+    const THUMB_UP_SVG =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path></svg>';
+    const THUMB_DOWN_SVG =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h3a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-3"></path></svg>';
+
+    function updateHistoryFeedback(agent, messageId, rating) {
+      const history = getHistory(agent);
+      const turn = history.find((t) => t.message_id === messageId);
+      if (turn) {
+        turn.feedback = rating;
+        setHistory(agent, history);
+      }
+    }
+
+    function createFeedbackRow(messageId, initialRating) {
+      const row = document.createElement("div");
+      row.className = "feedback-row";
+      let current = initialRating ?? null;
+
+      function makeBtn(svg, label) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "fb-btn";
+        btn.innerHTML = svg;
+        btn.setAttribute("aria-label", label);
+        return btn;
+      }
+
+      const up = makeBtn(THUMB_UP_SVG, "Good response");
+      const down = makeBtn(THUMB_DOWN_SVG, "Bad response");
+
+      function render() {
+        up.classList.toggle("active", current === 1);
+        down.classList.toggle("active", current === -1);
+        up.disabled = current !== null;
+        down.disabled = current !== null;
+      }
+      render();
+
+      async function vote(rating) {
+        if (current !== null) return;
+        const previous = current;
+        current = rating;
+        render();
+        try {
+          const resp = await fetch(`${API_BASE}/feedback`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-API-Key": getApiKey() },
+            body: JSON.stringify({ message_id: messageId, rating }),
+          });
+          if (!resp.ok) throw new Error("feedback request failed");
+          updateHistoryFeedback(currentAgent(), messageId, rating);
+        } catch {
+          current = previous;
+          render();
+        }
+      }
+
+      up.addEventListener("click", () => vote(1));
+      down.addEventListener("click", () => vote(-1));
+      row.append(up, down);
+      return row;
+    }
+
+    function renderMessage(role, content, meta = {}) {
       const row = document.createElement("div");
       row.className = `msg-row ${role}`;
 
@@ -446,6 +538,22 @@
         avatar.className = "avatar";
         avatar.textContent = currentAgent().charAt(0).toUpperCase();
         row.appendChild(avatar);
+
+        const col = document.createElement("div");
+        col.className = "bubble-col";
+
+        const bubble = document.createElement("div");
+        bubble.className = "msg";
+        bubble.textContent = content;
+        col.appendChild(bubble);
+
+        if (meta.messageId) {
+          col.appendChild(createFeedbackRow(meta.messageId, meta.feedback ?? null));
+        }
+
+        row.appendChild(col);
+        messagesEl.appendChild(row);
+        return bubble;
       }
 
       const bubble = document.createElement("div");
@@ -472,7 +580,7 @@
         return;
       }
       for (const turn of history) {
-        renderMessage(turn.role, turn.content);
+        renderMessage(turn.role, turn.content, { messageId: turn.message_id, feedback: turn.feedback });
       }
       scrollToBottom();
     }
@@ -595,7 +703,7 @@
         const data = await resp.json();
 
         if (!resp.ok) {
-          pending.parentElement.remove();
+          pending.closest(".msg-row").remove();
           renderMessage("error", data.detail || `Request failed (${resp.status})`);
           scrollToBottom();
           return;
@@ -604,12 +712,18 @@
         setSessionId(agent, data.session_id);
         pending.classList.remove("pending");
         pending.textContent = data.response;
+        pending.parentElement.appendChild(createFeedbackRow(data.message_id, null));
 
         const updatedHistory = getHistory(agent);
-        updatedHistory.push({ role: "assistant", content: data.response });
+        updatedHistory.push({
+          role: "assistant",
+          content: data.response,
+          message_id: data.message_id,
+          feedback: null,
+        });
         setHistory(agent, updatedHistory);
       } catch (err) {
-        pending.parentElement.remove();
+        pending.closest(".msg-row").remove();
         renderMessage("error", `Network error: ${err.message}`);
       } finally {
         sendBtn.disabled = false;

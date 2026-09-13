@@ -38,23 +38,42 @@ def init_db() -> None:
                 conn.execute("ALTER TABLE messages ADD COLUMN agent TEXT NOT NULL DEFAULT 'nexus'")
             except ValueError:
                 pass  # column already exists (fresh table, or already migrated)
+            try:
+                conn.execute("ALTER TABLE messages ADD COLUMN feedback INTEGER")
+            except ValueError:
+                pass  # column already exists (fresh table, or already migrated)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_agent ON messages(session_id, agent)")
             conn.commit()
         finally:
             conn.close()
 
 
-def add_message(session_id: str, agent: str, role: str, content: str) -> None:
+def add_message(session_id: str, agent: str, role: str, content: str) -> int:
     with _lock:
         conn = _get_connection()
         try:
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO messages (session_id, agent, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
                 (session_id, agent, role, content, datetime.now(timezone.utc).isoformat()),
             )
+            message_id = cursor.lastrowid
             conn.commit()
         finally:
             conn.close()
+    return message_id
+
+
+def set_feedback(message_id: int, rating: int) -> bool:
+    """Record feedback on a message. Returns False if no message with that id exists."""
+    with _lock:
+        conn = _get_connection()
+        try:
+            cursor = conn.execute("UPDATE messages SET feedback = ? WHERE id = ?", (rating, message_id))
+            updated = cursor.rowcount > 0
+            conn.commit()
+        finally:
+            conn.close()
+    return updated
 
 
 def get_history(session_id: str, agent: str, limit: int = 20) -> list[dict]:

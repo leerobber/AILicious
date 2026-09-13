@@ -23,6 +23,8 @@ Both chat endpoints accept an optional `session_id`; when included, the last 20 
 
 Both chat endpoints are also rate-limited (default 20 requests/minute, per API key — or per client IP locally if `APP_API_KEY` is unset) and cap message length (default 4000 characters), to keep a leaked key or a client bug from running up unbounded Mistral usage. Tune via `RATE_LIMIT_PER_MINUTE` and `MAX_MESSAGE_LENGTH`; exceeding either returns a normal error the PWA already displays inline (429 with a `Retry-After` header, or 400).
 
+Every chat response includes a `message_id`; `POST /feedback` (`{message_id, rating}`, rating `1` or `-1`) records a thumbs up/down on that specific reply. The PWA shows this as small thumb icons under each assistant message — the first step toward KAIROS (see below), since utility scoring needs a real signal, not just heuristics.
+
 ### Run locally
 
 ```bash
@@ -94,4 +96,6 @@ To set it up:
 
 ### Next steps
 
-The original plan's phases are now all in place: cloud backend, remote inference, durable memory, personas, full agent swarm, the Android/web client, basic hardening (rate limiting, message-length caps), and a CI-backed test suite. What's left is the KAIROS/SAGE self-improvement loops from the original blueprint — a design task before it's a coding task — and eventually real per-user auth if this is ever used by more than one person, rather than a single shared API key.
+The original plan's phases are now all in place: cloud backend, remote inference, durable memory, personas, full agent swarm, the Android/web client, basic hardening (rate limiting, message-length caps), and a CI-backed test suite.
+
+KAIROS/SAGE — the self-improvement loops from the original blueprint — are underway, shipped as incremental steps: feedback capture (this PR) is the first, followed by utility-weighted memory retrieval (KAIROS) and an on-demand persona-evolution proposal-and-approval flow (SAGE). Neither is a scheduled background worker — Render's free tier doesn't support that without cost, and the service sleeps when idle anyway — so KAIROS is inline scoring computed at write/read time, and SAGE is triggered on demand rather than autonomously. Eventually, real per-user auth if this is ever used by more than one person, rather than a single shared API key.
