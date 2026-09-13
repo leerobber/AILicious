@@ -6,6 +6,8 @@ Personality-driven, multi-agent AI system with cloud-based inference and memory,
 
 A single-page PWA is served directly by the backend at `/` (`backend/static/index.html` — no build step, no separate host). Open the Render URL on an Android phone in Chrome, enter the API key in Settings (gear icon), pick an agent from the dropdown, and chat. "Add to Home Screen" installs it as a standalone app icon via the manifest + service worker in `backend/static/`.
 
+The service worker (`sw.js`) fetches network-first, caching only as an offline fallback — every successful load re-fetches from the live server, so a new deploy reaches an already-installed client on its very next load. (An earlier cache-first version pinned whatever `index.html` a client first cached indefinitely, since `CACHE_NAME` never changed between deploys — a real fix could ship and a phone would keep silently serving the old app shell forever. If a very old client still looks stale after this fix ships, one manual site-data clear resets it; every load after that self-heals.)
+
 Client-side notes:
 - The API key is stored in the browser's `localStorage`, sent only as an `X-API-Key` header to this same-origin backend — never committed, never sent anywhere else.
 - Each agent gets its own `session_id` and message history in `localStorage`, matching the backend's per-agent memory scoping — switching agents shows that agent's own conversation, not a mixed one.

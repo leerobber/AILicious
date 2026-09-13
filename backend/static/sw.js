@@ -1,4 +1,4 @@
-const CACHE_NAME = "ailicious-shell-v1";
+const CACHE_NAME = "ailicious-shell-v2";
 const APP_SHELL = ["/", "/manifest.json", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (event) => {
@@ -15,7 +15,22 @@ self.addEventListener("activate", (event) => {
   self.clients.claim();
 });
 
+// Network-first, cache as offline fallback -- a deploy should always reach an already-
+// installed client on its very next load. Cache-first (the previous strategy) served a
+// pinned app shell forever once installed, since CACHE_NAME never changed between
+// deploys: a real deploy could update the server while every existing client kept
+// serving its first-ever cached index.html indefinitely, invisibly. The cache still
+// gets refreshed on every successful fetch, so this keeps the offline-capable PWA
+// benefit without the staleness trap.
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
-  event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request)));
+  event.respondWith(
+    fetch(event.request)
+      .then((response) => {
+        const responseCopy = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, responseCopy));
+        return response;
+      })
+      .catch(() => caches.match(event.request))
+  );
 });
