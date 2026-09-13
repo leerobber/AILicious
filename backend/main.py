@@ -8,6 +8,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from core.memory import add_message, get_history, get_stats, init_db
+from core.persona import get_system_prompt, load_personas
 
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
@@ -19,6 +20,7 @@ HISTORY_LIMIT = 20
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(init_db)
+    await asyncio.to_thread(load_personas)
     yield
 
 
@@ -61,7 +63,8 @@ async def chat(req: ChatRequest, x_api_key: str | None = Header(default=None)) -
     session_id = req.session_id or str(uuid.uuid4())
 
     history = await asyncio.to_thread(get_history, session_id, HISTORY_LIMIT)
-    messages = history + [{"role": "user", "content": req.message}]
+    system_prompt = get_system_prompt()
+    messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": req.message}]
 
     payload = {"model": MISTRAL_MODEL, "messages": messages}
     headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}"}
