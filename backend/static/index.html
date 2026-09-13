@@ -298,18 +298,19 @@
   button#send:active:not(:disabled) { transform: scale(0.92); }
   button#send:disabled { opacity: 0.4; cursor: default; }
 
-  dialog#settings {
+  dialog#settings, dialog#sage {
     background: #141c33;
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 16px;
     padding: 22px;
-    max-width: 360px;
     width: calc(100% - 32px);
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
   }
-  dialog#settings::backdrop { background: rgba(4, 8, 20, 0.7); backdrop-filter: blur(2px); }
-  dialog#settings h2 { margin-top: 0; font-size: 17px; }
+  dialog#settings { max-width: 360px; }
+  dialog#sage { max-width: 440px; max-height: calc(100% - 64px); overflow-y: auto; }
+  dialog#settings::backdrop, dialog#sage::backdrop { background: rgba(4, 8, 20, 0.7); backdrop-filter: blur(2px); }
+  dialog#settings h2, dialog#sage h2 { margin-top: 0; font-size: 17px; }
   dialog#settings label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 6px; }
   dialog#settings input[type="password"] {
     width: 100%;
@@ -323,8 +324,8 @@
     transition: border-color 0.15s ease;
   }
   dialog#settings input[type="password"]:focus { outline: none; border-color: var(--accent); }
-  dialog#settings .row { display: flex; gap: 8px; justify-content: flex-end; }
-  dialog#settings button {
+  dialog#settings .row, dialog#sage .row { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+  dialog#settings button, dialog#sage button {
     border: none;
     border-radius: 10px;
     padding: 9px 15px;
@@ -332,13 +333,40 @@
     cursor: pointer;
     transition: filter 0.15s ease, transform 0.1s ease;
   }
-  dialog#settings button:active { transform: scale(0.96); }
-  dialog#settings button.save { background: var(--accent); color: #04263a; font-weight: 600; }
-  dialog#settings button.save:hover { filter: brightness(1.08); }
-  dialog#settings button.danger { background: transparent; color: var(--error); }
-  dialog#settings button.danger:hover { background: rgba(251, 113, 133, 0.1); }
-  dialog#settings button.cancel { background: var(--panel-2); color: var(--text); }
-  dialog#settings button.cancel:hover { filter: brightness(1.2); }
+  dialog#settings button:active, dialog#sage button:active { transform: scale(0.96); }
+  dialog#settings button.save, dialog#sage button.save { background: var(--accent); color: #04263a; font-weight: 600; }
+  dialog#settings button.save:hover, dialog#sage button.save:hover { filter: brightness(1.08); }
+  dialog#settings button.danger, dialog#sage button.danger { background: transparent; color: var(--error); }
+  dialog#settings button.danger:hover, dialog#sage button.danger:hover { background: rgba(251, 113, 133, 0.1); }
+  dialog#settings button.cancel, dialog#sage button.cancel { background: var(--panel-2); color: var(--text); }
+  dialog#settings button.cancel:hover, dialog#sage button.cancel:hover { filter: brightness(1.2); }
+
+  #sage-analyze { width: 100%; margin-bottom: 4px; }
+  .sage-section { margin-bottom: 14px; }
+  .sage-status { font-size: 13px; min-height: 16px; margin: 6px 0 0; }
+  .proposal-list { display: flex; flex-direction: column; gap: 10px; }
+  .proposal-card {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px;
+  }
+  .proposal-card .rationale { font-size: 13px; color: var(--text-dim); margin-bottom: 8px; }
+  .proposal-card .prompt-preview {
+    font-size: 13px;
+    white-space: pre-wrap;
+    background: var(--bg-2);
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    max-height: 140px;
+    overflow-y: auto;
+  }
+  .proposal-card button.accept { background: var(--success); color: #04250f; font-weight: 600; }
+  .proposal-card button.accept:hover { filter: brightness(1.08); }
+  .proposal-card button.reject { background: transparent; color: var(--error); border: 1px solid var(--error); }
+  .proposal-card button.reject:hover { background: rgba(251, 113, 133, 0.1); }
+  .no-proposals { font-size: 13px; color: var(--text-dim); text-align: center; padding: 12px 0; }
 </style>
 </head>
 <body>
@@ -389,11 +417,29 @@
     />
     <div id="key-status" style="font-size: 13px; margin: 0 0 16px; min-height: 16px;"></div>
     <div class="row">
+      <button type="button" class="cancel" id="open-sage">Persona (SAGE)</button>
       <button type="button" class="danger" id="clear-history">Clear this agent's chat</button>
     </div>
     <div class="row" style="margin-top: 12px;">
       <button type="button" class="cancel" id="settings-cancel">Cancel</button>
       <button type="button" class="save" id="settings-save">Save &amp; test</button>
+    </div>
+  </dialog>
+
+  <dialog id="sage">
+    <h2>SAGE — <span id="sage-agent-name"></span> persona</h2>
+    <div class="sage-section">
+      <button type="button" class="save" id="sage-analyze">Analyze feedback</button>
+      <div class="sage-status" id="sage-analyze-status"></div>
+    </div>
+    <div class="sage-section">
+      <div id="sage-proposals" class="proposal-list"></div>
+    </div>
+    <div class="row">
+      <button type="button" class="danger" id="sage-reset">Reset persona to default</button>
+    </div>
+    <div class="row" style="margin-top: 12px;">
+      <button type="button" class="cancel" id="sage-close">Close</button>
     </div>
   </dialog>
 
@@ -423,6 +469,14 @@
     const settingsCancel = document.getElementById("settings-cancel");
     const clearHistoryBtn = document.getElementById("clear-history");
     const keyStatusEl = document.getElementById("key-status");
+    const openSageBtn = document.getElementById("open-sage");
+    const sageDialog = document.getElementById("sage");
+    const sageAgentNameEl = document.getElementById("sage-agent-name");
+    const sageCloseBtn = document.getElementById("sage-close");
+    const sageAnalyzeBtn = document.getElementById("sage-analyze");
+    const sageAnalyzeStatusEl = document.getElementById("sage-analyze-status");
+    const sageProposalsEl = document.getElementById("sage-proposals");
+    const sageResetBtn = document.getElementById("sage-reset");
 
     function storageKey(agent, suffix) {
       return `ailicious_${suffix}_${agent}`;
@@ -649,6 +703,144 @@
       localStorage.removeItem(storageKey(agent, "session"));
       renderHistory(agent);
       settingsDialog.close();
+    });
+
+    function setSageStatus(text, color) {
+      sageAnalyzeStatusEl.textContent = text;
+      sageAnalyzeStatusEl.style.color = color;
+    }
+
+    function renderNoProposals(text = "No pending proposals yet.") {
+      sageProposalsEl.innerHTML = `<div class="no-proposals">${text}</div>`;
+    }
+
+    function renderProposalCard(proposal) {
+      const card = document.createElement("div");
+      card.className = "proposal-card";
+
+      const rationale = document.createElement("div");
+      rationale.className = "rationale";
+      rationale.textContent = proposal.rationale;
+      card.appendChild(rationale);
+
+      const preview = document.createElement("div");
+      preview.className = "prompt-preview";
+      preview.textContent = proposal.proposed_system_prompt;
+      card.appendChild(preview);
+
+      const row = document.createElement("div");
+      row.className = "row";
+
+      const acceptBtn = document.createElement("button");
+      acceptBtn.type = "button";
+      acceptBtn.className = "accept";
+      acceptBtn.textContent = "Accept";
+
+      const rejectBtn = document.createElement("button");
+      rejectBtn.type = "button";
+      rejectBtn.className = "reject";
+      rejectBtn.textContent = "Reject";
+
+      async function decide(action) {
+        acceptBtn.disabled = true;
+        rejectBtn.disabled = true;
+        try {
+          const resp = await fetch(`${API_BASE}/sage/proposals/${proposal.id}/${action}`, {
+            method: "POST",
+            headers: { "X-API-Key": getApiKey() },
+          });
+          if (!resp.ok) throw new Error(`request failed (${resp.status})`);
+          card.remove();
+          if (!sageProposalsEl.children.length) renderNoProposals();
+        } catch (err) {
+          acceptBtn.disabled = false;
+          rejectBtn.disabled = false;
+          setSageStatus(`✗ Couldn't ${action} proposal: ${err.message}`, "var(--error)");
+        }
+      }
+
+      acceptBtn.addEventListener("click", () => decide("accept"));
+      rejectBtn.addEventListener("click", () => decide("reject"));
+
+      row.append(acceptBtn, rejectBtn);
+      card.appendChild(row);
+      return card;
+    }
+
+    async function loadProposals() {
+      const agent = currentAgent();
+      sageProposalsEl.innerHTML = '<div class="no-proposals">Loading…</div>';
+      try {
+        const resp = await fetch(`${API_BASE}/sage/proposals?agent=${agent}&status=pending`, {
+          headers: { "X-API-Key": getApiKey() },
+        });
+        if (!resp.ok) throw new Error(`request failed (${resp.status})`);
+        const data = await resp.json();
+        sageProposalsEl.innerHTML = "";
+        if (!data.proposals.length) {
+          renderNoProposals();
+          return;
+        }
+        for (const proposal of data.proposals) {
+          sageProposalsEl.appendChild(renderProposalCard(proposal));
+        }
+      } catch (err) {
+        renderNoProposals(`Couldn't load proposals: ${err.message}`);
+      }
+    }
+
+    openSageBtn.addEventListener("click", () => {
+      if (!getApiKey()) {
+        setKeyStatus("Save an API key first.", "var(--error)");
+        return;
+      }
+      settingsDialog.close();
+      sageAgentNameEl.textContent = currentAgent().toUpperCase();
+      setSageStatus("", "");
+      sageDialog.showModal();
+      loadProposals();
+    });
+
+    sageCloseBtn.addEventListener("click", () => sageDialog.close());
+
+    sageAnalyzeBtn.addEventListener("click", async () => {
+      const agent = currentAgent();
+      sageAnalyzeBtn.disabled = true;
+      setSageStatus("Analyzing feedback…", "var(--text-dim)");
+      try {
+        const resp = await fetch(`${API_BASE}/sage/analyze/${agent}`, {
+          method: "POST",
+          headers: { "X-API-Key": getApiKey() },
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          setSageStatus(`✗ ${data.detail || `Request failed (${resp.status})`}`, "var(--error)");
+          return;
+        }
+        setSageStatus("✓ New proposal ready below.", "var(--success)");
+        await loadProposals();
+      } catch (err) {
+        setSageStatus(`✗ Network error: ${err.message}`, "var(--error)");
+      } finally {
+        sageAnalyzeBtn.disabled = false;
+      }
+    });
+
+    sageResetBtn.addEventListener("click", async () => {
+      const agent = currentAgent();
+      sageResetBtn.disabled = true;
+      try {
+        const resp = await fetch(`${API_BASE}/sage/reset/${agent}`, {
+          method: "POST",
+          headers: { "X-API-Key": getApiKey() },
+        });
+        if (!resp.ok) throw new Error(`request failed (${resp.status})`);
+        setSageStatus("✓ Reset to default persona.", "var(--success)");
+      } catch (err) {
+        setSageStatus(`✗ Couldn't reset: ${err.message}`, "var(--error)");
+      } finally {
+        sageResetBtn.disabled = false;
+      }
     });
 
     // auto-grow textarea up to CSS max-height
