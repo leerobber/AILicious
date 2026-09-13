@@ -1,13 +1,9 @@
-import os
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
 
-import libsql
+from core.db import DB_PATH, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL
+from core.db import get_connection as _db_get_connection
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "memory.db"
-TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
-TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 _lock = threading.Lock()
 
 # KAIROS: utility-weighted retrieval. A message's stored utility_score combines a small
@@ -28,10 +24,7 @@ def _heuristic_score(content: str) -> float:
 
 
 def _get_connection():
-    if TURSO_DATABASE_URL:
-        return libsql.connect(TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return libsql.connect(str(DB_PATH))
+    return _db_get_connection(DB_PATH, TURSO_DATABASE_URL, TURSO_AUTH_TOKEN)
 
 
 def init_db() -> None:

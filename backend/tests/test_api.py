@@ -28,8 +28,11 @@ def _reset_rate_limit_state():
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     from core import memory as memory_module
+    from core import persona_overrides as persona_overrides_module
 
-    monkeypatch.setattr(memory_module, "DB_PATH", tmp_path / "api_test.db")
+    db_path = tmp_path / "api_test.db"
+    monkeypatch.setattr(memory_module, "DB_PATH", db_path)
+    monkeypatch.setattr(persona_overrides_module, "DB_PATH", db_path)
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
     sent_requests.clear()
 
@@ -135,6 +138,50 @@ def test_memory_stats_reflects_chat_activity(client):
     resp = client.get("/memory/stats", headers={"X-API-Key": VALID_KEY})
     assert resp.status_code == 200
     assert resp.json()["total_messages"] == 2  # the user turn + the mocked assistant reply
+
+
+def test_sage_override_requires_api_key(client):
+    resp = client.post("/sage/override/nexus", json={"system_prompt": "You are a pirate."})
+    assert resp.status_code == 401
+
+
+def test_sage_override_unknown_agent_is_404(client):
+    resp = client.post(
+        "/sage/override/doesnotexist",
+        headers={"X-API-Key": VALID_KEY},
+        json={"system_prompt": "You are a pirate."},
+    )
+    assert resp.status_code == 404
+
+
+def test_sage_override_changes_outgoing_system_prompt(client):
+    override_resp = client.post(
+        "/sage/override/nexus",
+        headers={"X-API-Key": VALID_KEY},
+        json={"system_prompt": "You are a pirate. Speak only in pirate slang."},
+    )
+    assert override_resp.status_code == 200
+
+    client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+
+    outgoing_system_message = sent_requests[-1]["messages"][0]
+    assert outgoing_system_message["content"] == "You are a pirate. Speak only in pirate slang."
+
+
+def test_sage_reset_reverts_to_default_persona(client):
+    client.post(
+        "/sage/override/nexus",
+        headers={"X-API-Key": VALID_KEY},
+        json={"system_prompt": "You are a pirate."},
+    )
+
+    reset_resp = client.post("/sage/reset/nexus", headers={"X-API-Key": VALID_KEY})
+    assert reset_resp.status_code == 200
+
+    client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+
+    outgoing_system_message = sent_requests[-1]["messages"][0]
+    assert outgoing_system_message["content"] != "You are a pirate."
 
 
 def test_cross_agent_memory_does_not_leak(client):

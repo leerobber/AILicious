@@ -31,6 +31,15 @@ Every stored message carries a `utility_score`, seeded at write time by a small 
 
 This isn't a scheduled background job — Render's free tier has no free cron, and the service sleeps when idle anyway — so KAIROS is inline scoring computed synchronously at write/read time. When nothing has any feedback yet (the common case for a new or quiet agent), ranking collapses to exactly what a plain `ORDER BY id DESC LIMIT` would return — zero behavior change until real signal exists.
 
+### SAGE (persona evolution) — foundation
+
+An agent's `system_prompt` can now be overridden at runtime without touching its YAML file or redeploying — the first building block for SAGE (on-demand, LLM-proposed persona revisions, coming next). Overrides live in a `persona_overrides` table (`agent` primary key, one row per agent) and take precedence over the YAML default whenever present; `run_agent_chat` checks the override table before falling back to `get_system_prompt`.
+
+- `POST /sage/override/{agent}` (`{system_prompt}`) — sets or replaces an agent's override directly. Mostly a manual/testing escape hatch for now; SAGE's proposal flow (next PR) will call this same storage after a human accepts a proposal.
+- `POST /sage/reset/{agent}` — clears the override, reverting the agent to its YAML-defined persona.
+
+An override never touches the YAML files themselves — which wouldn't survive Render's ephemeral filesystem anyway — so resetting is always instant and always available.
+
 ### Run locally
 
 ```bash
@@ -78,7 +87,7 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-Covers persona loading, memory (round-trips, per-agent/per-session isolation, the schema-migration guard, KAIROS's utility-weighted ranking — including a case a plain-recency implementation would get wrong), rate limiting, and the API layer end to end (auth, 404s, the length cap, the 429 path, and — the one that matters most — that one agent's conversation never leaks into another's outgoing request to Mistral, checked by inspecting the mocked request payload itself rather than just row counts). The Mistral call is mocked so tests run offline with no API key or network access needed; everything else exercises real code paths, including a real local `libsql` database per test.
+Covers persona loading, memory (round-trips, per-agent/per-session isolation, the schema-migration guard, KAIROS's utility-weighted ranking — including a case a plain-recency implementation would get wrong), persona overrides (round-trip, upsert, reset, per-agent scoping), rate limiting, and the API layer end to end (auth, 404s, the length cap, the 429 path, SAGE override/reset actually changing the outgoing Mistral request, and — the one that matters most — that one agent's conversation never leaks into another's outgoing request to Mistral, checked by inspecting the mocked request payload itself rather than just row counts). The Mistral call is mocked so tests run offline with no API key or network access needed; everything else exercises real code paths, including a real local `libsql` database per test.
 
 Runs automatically on every PR and push to `main` via `.github/workflows/ci.yml`.
 
@@ -104,4 +113,4 @@ To set it up:
 
 The original plan's phases are now all in place: cloud backend, remote inference, durable memory, personas, full agent swarm, the Android/web client, basic hardening (rate limiting, message-length caps), and a CI-backed test suite.
 
-KAIROS/SAGE — the self-improvement loops from the original blueprint — are underway, shipped as incremental steps: feedback capture and utility-weighted memory retrieval (KAIROS, this PR) are done, followed by an on-demand persona-evolution proposal-and-approval flow (SAGE). Neither is a scheduled background worker — Render's free tier doesn't support that without cost, and the service sleeps when idle anyway — so KAIROS is inline scoring computed at write/read time, and SAGE will be triggered on demand rather than autonomously. Eventually, real per-user auth if this is ever used by more than one person, rather than a single shared API key.
+KAIROS/SAGE — the self-improvement loops from the original blueprint — are underway, shipped as incremental steps: feedback capture, utility-weighted memory retrieval (KAIROS), and override storage with manual controls (SAGE foundation, this PR) are done. Still to come: SAGE's actual proposal generation (an LLM call that analyzes an agent's liked/disliked replies and proposes a revised `system_prompt`, stored pending until a human accepts or rejects it) and a PWA panel to trigger and review those proposals. Neither KAIROS nor SAGE is a scheduled background worker — Render's free tier doesn't support that without cost, and the service sleeps when idle anyway — so KAIROS is inline scoring computed at write/read time, and SAGE is triggered on demand rather than autonomously. Eventually, real per-user auth if this is ever used by more than one person, rather than a single shared API key.
