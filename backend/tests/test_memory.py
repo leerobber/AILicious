@@ -10,6 +10,31 @@ def isolated_db(tmp_path, monkeypatch):
     yield
 
 
+def test_add_message_returns_new_row_id():
+    id1 = memory_module.add_message("s1", "nexus", "user", "a")
+    id2 = memory_module.add_message("s1", "nexus", "user", "b")
+
+    assert isinstance(id1, int)
+    assert id2 == id1 + 1
+
+
+def test_set_feedback_roundtrip():
+    import libsql
+
+    message_id = memory_module.add_message("s1", "nexus", "assistant", "reply")
+
+    assert memory_module.set_feedback(message_id, 1) is True
+
+    conn = libsql.connect(str(memory_module.DB_PATH))
+    row = conn.execute("SELECT feedback FROM messages WHERE id = ?", (message_id,)).fetchone()
+    conn.close()
+    assert row[0] == 1
+
+
+def test_set_feedback_unknown_id_returns_false():
+    assert memory_module.set_feedback(999999, 1) is False
+
+
 def test_add_and_get_history_roundtrip():
     memory_module.add_message("s1", "nexus", "user", "hello")
     memory_module.add_message("s1", "nexus", "assistant", "hi there")

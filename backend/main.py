@@ -9,7 +9,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from core.memory import add_message, get_history, get_stats, init_db
+from core.memory import add_message, get_history, get_stats, init_db, set_feedback
 from core.persona import get_system_prompt, has_persona, list_personas, load_personas
 from core.ratelimit import check_rate_limit
 
@@ -42,6 +42,12 @@ class ChatResponse(BaseModel):
     response: str
     session_id: str
     agent: str
+    message_id: int
+
+
+class FeedbackRequest(BaseModel):
+    message_id: int
+    rating: int
 
 
 def require_api_key(x_api_key: str | None) -> None:
@@ -93,9 +99,9 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
     reply = data["choices"][0]["message"]["content"]
 
     await asyncio.to_thread(add_message, session_id, agent, "user", message)
-    await asyncio.to_thread(add_message, session_id, agent, "assistant", reply)
+    message_id = await asyncio.to_thread(add_message, session_id, agent, "assistant", reply)
 
-    return ChatResponse(response=reply, session_id=session_id, agent=agent)
+    return ChatResponse(response=reply, session_id=session_id, agent=agent, message_id=message_id)
 
 
 @app.get("/health")
@@ -131,6 +137,18 @@ async def chat_with_agent(
     if not has_persona(name):
         raise HTTPException(status_code=404, detail=f"Unknown agent '{name}'. Available: {list_personas()}")
     return await run_agent_chat(name, req.message, req.session_id)
+
+
+@app.post("/feedback")
+async def feedback(req: FeedbackRequest, request: Request, x_api_key: str | None = Header(default=None)) -> dict:
+    require_api_key(x_api_key)
+    enforce_rate_limit(x_api_key or (request.client.host if request.client else "unknown"))
+    if req.rating not in (1, -1):
+        raise HTTPException(status_code=400, detail="rating must be 1 (up) or -1 (down)")
+    updated = await asyncio.to_thread(set_feedback, req.message_id, req.rating)
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"No message with id {req.message_id}")
+    return {"status": "ok"}
 
 
 # Mounted last so it only catches paths not already matched by an API route above.
