@@ -11,6 +11,8 @@ from pydantic import BaseModel
 
 from core.memory import add_message, get_history, get_stats, init_db, set_feedback
 from core.persona import get_system_prompt, has_persona, list_personas, load_personas
+from core.persona_overrides import clear_override, get_override, set_override
+from core.persona_overrides import init_db as init_persona_overrides_db
 from core.ratelimit import check_rate_limit
 
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
@@ -26,6 +28,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(init_db)
+    await asyncio.to_thread(init_persona_overrides_db)
     await asyncio.to_thread(load_personas)
     yield
 
@@ -48,6 +51,10 @@ class ChatResponse(BaseModel):
 class FeedbackRequest(BaseModel):
     message_id: int
     rating: int
+
+
+class PersonaOverrideRequest(BaseModel):
+    system_prompt: str
 
 
 def require_api_key(x_api_key: str | None) -> None:
@@ -78,7 +85,8 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
     session_id = session_id or str(uuid.uuid4())
 
     history = await asyncio.to_thread(get_history, session_id, agent, HISTORY_LIMIT)
-    system_prompt = get_system_prompt(agent)
+    override = await asyncio.to_thread(get_override, agent)
+    system_prompt = override if override is not None else get_system_prompt(agent)
     messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": message}]
 
     payload = {"model": MISTRAL_MODEL, "messages": messages}
@@ -148,6 +156,26 @@ async def feedback(req: FeedbackRequest, request: Request, x_api_key: str | None
     updated = await asyncio.to_thread(set_feedback, req.message_id, req.rating)
     if not updated:
         raise HTTPException(status_code=404, detail=f"No message with id {req.message_id}")
+    return {"status": "ok"}
+
+
+@app.post("/sage/override/{agent}")
+async def sage_override(
+    agent: str, req: PersonaOverrideRequest, x_api_key: str | None = Header(default=None)
+) -> dict:
+    require_api_key(x_api_key)
+    if not has_persona(agent):
+        raise HTTPException(status_code=404, detail=f"Unknown agent '{agent}'. Available: {list_personas()}")
+    await asyncio.to_thread(set_override, agent, req.system_prompt)
+    return {"status": "ok"}
+
+
+@app.post("/sage/reset/{agent}")
+async def sage_reset(agent: str, x_api_key: str | None = Header(default=None)) -> dict:
+    require_api_key(x_api_key)
+    if not has_persona(agent):
+        raise HTTPException(status_code=404, detail=f"Unknown agent '{agent}'. Available: {list_personas()}")
+    await asyncio.to_thread(clear_override, agent)
     return {"status": "ok"}
 
 
