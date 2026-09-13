@@ -4,7 +4,7 @@ Personality-driven, multi-agent AI system with cloud-based inference and memory,
 
 ## Backend (Phase 1: minimal walking skeleton)
 
-A FastAPI service that proxies chat messages to Mistral, with SQLite-backed conversation memory. `POST /chat` accepts an optional `session_id`; when included, the last 20 messages for that session are sent back to Mistral as context, so the model actually remembers earlier turns in the same conversation.
+A FastAPI service that proxies chat messages to Mistral, with SQLite-backed conversation memory and a NEXUS persona. `POST /chat` accepts an optional `session_id`; when included, the last 20 messages for that session are sent back to Mistral as context, so the model actually remembers earlier turns in the same conversation. Every request is prefixed with NEXUS's system prompt, loaded from `backend/config/personas/nexus.yaml` at startup — edit that file to change how it talks, no code changes needed.
 
 ### Run locally
 
@@ -48,4 +48,4 @@ curl http://127.0.0.1:8000/memory/stats -H "X-API-Key: $APP_API_KEY"
 
 ### Next steps
 
-Load the NEXUS persona from YAML, wire up the remaining agents (FORGE, ORACLE, SENTINEL, CODEX, AVERY), then build the Android PWA client.
+Wire up the remaining agents (FORGE, ORACLE, SENTINEL, CODEX, AVERY), then build the Android PWA client.
