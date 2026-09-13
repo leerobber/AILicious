@@ -21,28 +21,33 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
+                agent TEXT NOT NULL DEFAULT 'nexus',
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
             """
         )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
+        try:
+            conn.execute("ALTER TABLE messages ADD COLUMN agent TEXT NOT NULL DEFAULT 'nexus'")
+        except sqlite3.OperationalError:
+            pass  # column already exists (fresh table, or already migrated)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_agent ON messages(session_id, agent)")
 
 
-def add_message(session_id: str, role: str, content: str) -> None:
+def add_message(session_id: str, agent: str, role: str, content: str) -> None:
     with _lock, _get_connection() as conn:
         conn.execute(
-            "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (session_id, role, content, datetime.now(timezone.utc).isoformat()),
+            "INSERT INTO messages (session_id, agent, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+            (session_id, agent, role, content, datetime.now(timezone.utc).isoformat()),
         )
 
 
-def get_history(session_id: str, limit: int = 20) -> list[dict]:
+def get_history(session_id: str, agent: str, limit: int = 20) -> list[dict]:
     with _lock, _get_connection() as conn:
         rows = conn.execute(
-            "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
-            (session_id, limit),
+            "SELECT role, content FROM messages WHERE session_id = ? AND agent = ? ORDER BY id DESC LIMIT ?",
+            (session_id, agent, limit),
         ).fetchall()
     return [{"role": row["role"], "content": row["content"]} for row in reversed(rows)]
 

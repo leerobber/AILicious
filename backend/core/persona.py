@@ -19,3 +19,11 @@ def get_system_prompt(name: str = "nexus") -> str:
     if not persona:
         raise KeyError(f"Persona '{name}' is not loaded")
     return persona["system_prompt"]
+
+
+def has_persona(name: str) -> bool:
+    return name in _personas
+
+
+def list_personas() -> list[str]:
+    return sorted(_personas.keys())

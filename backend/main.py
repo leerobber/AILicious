@@ -8,7 +8,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from core.memory import add_message, get_history, get_stats, init_db
-from core.persona import get_system_prompt, load_personas
+from core.persona import get_system_prompt, has_persona, list_personas, load_personas
 
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
@@ -35,6 +35,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     session_id: str
+    agent: str
 
 
 def require_api_key(x_api_key: str | None) -> None:
@@ -42,29 +43,15 @@ def require_api_key(x_api_key: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-@app.get("/health")
-async def health() -> dict:
-    return {"status": "ok", "mistral_configured": bool(MISTRAL_API_KEY)}
-
-
-@app.get("/memory/stats")
-async def memory_stats(x_api_key: str | None = Header(default=None)) -> dict:
-    require_api_key(x_api_key)
-    return await asyncio.to_thread(get_stats)
-
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, x_api_key: str | None = Header(default=None)) -> ChatResponse:
-    require_api_key(x_api_key)
-
+async def run_agent_chat(agent: str, message: str, session_id: str | None) -> ChatResponse:
     if not MISTRAL_API_KEY:
         raise HTTPException(status_code=500, detail="MISTRAL_API_KEY is not configured on the server")
 
-    session_id = req.session_id or str(uuid.uuid4())
+    session_id = session_id or str(uuid.uuid4())
 
-    history = await asyncio.to_thread(get_history, session_id, HISTORY_LIMIT)
-    system_prompt = get_system_prompt()
-    messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": req.message}]
+    history = await asyncio.to_thread(get_history, session_id, agent, HISTORY_LIMIT)
+    system_prompt = get_system_prompt(agent)
+    messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": message}]
 
     payload = {"model": MISTRAL_MODEL, "messages": messages}
     headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}"}
@@ -83,7 +70,38 @@ async def chat(req: ChatRequest, x_api_key: str | None = Header(default=None)) -
     data = resp.json()
     reply = data["choices"][0]["message"]["content"]
 
-    await asyncio.to_thread(add_message, session_id, "user", req.message)
-    await asyncio.to_thread(add_message, session_id, "assistant", reply)
+    await asyncio.to_thread(add_message, session_id, agent, "user", message)
+    await asyncio.to_thread(add_message, session_id, agent, "assistant", reply)
 
-    return ChatResponse(response=reply, session_id=session_id)
+    return ChatResponse(response=reply, session_id=session_id, agent=agent)
+
+
+@app.get("/health")
+async def health() -> dict:
+    return {"status": "ok", "mistral_configured": bool(MISTRAL_API_KEY)}
+
+
+@app.get("/agents")
+async def agents(x_api_key: str | None = Header(default=None)) -> dict:
+    require_api_key(x_api_key)
+    return {"agents": list_personas()}
+
+
+@app.get("/memory/stats")
+async def memory_stats(x_api_key: str | None = Header(default=None)) -> dict:
+    require_api_key(x_api_key)
+    return await asyncio.to_thread(get_stats)
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest, x_api_key: str | None = Header(default=None)) -> ChatResponse:
+    require_api_key(x_api_key)
+    return await run_agent_chat("nexus", req.message, req.session_id)
+
+
+@app.post("/agents/{name}", response_model=ChatResponse)
+async def chat_with_agent(name: str, req: ChatRequest, x_api_key: str | None = Header(default=None)) -> ChatResponse:
+    require_api_key(x_api_key)
+    if not has_persona(name):
+        raise HTTPException(status_code=404, detail=f"Unknown agent '{name}'. Available: {list_personas()}")
+    return await run_agent_chat(name, req.message, req.session_id)
