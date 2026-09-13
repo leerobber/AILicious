@@ -13,7 +13,7 @@ Client-side notes:
 
 ## Backend (Phase 1: minimal walking skeleton)
 
-A FastAPI service that proxies chat messages to Mistral, with SQLite-backed conversation memory and six personas (NEXUS, FORGE, ORACLE, SENTINEL, CODEX, AVERY) loaded from YAML at startup.
+A FastAPI service that proxies chat messages to Mistral, with SQLite-compatible conversation memory (local file, or Turso for durability — see below) and six personas (NEXUS, FORGE, ORACLE, SENTINEL, CODEX, AVERY) loaded from YAML at startup.
 
 - `POST /chat` — always talks to NEXUS, the default entry point.
 - `POST /agents/{name}` — talk to a specific agent directly (`forge`, `oracle`, `sentinel`, `codex`, or `avery`); 404 if the name isn't a loaded persona.
@@ -58,16 +58,26 @@ curl -X POST http://127.0.0.1:8000/agents/forge \
 curl http://127.0.0.1:8000/memory/stats -H "X-API-Key: $APP_API_KEY"
 ```
 
-`APP_API_KEY` is optional locally (auth is skipped if unset) but should always be set in production. Conversation history is stored in `backend/data/memory.db` (SQLite, gitignored).
+`APP_API_KEY` is optional locally (auth is skipped if unset) but should always be set in production.
 
-**Render free-tier caveat:** the free plan's filesystem is ephemeral, so `memory.db` is wiped on every deploy and periodically on restart. Conversations won't survive across deploys until this moves to a persistent store (a paid Render Disk, or an external DB like Turso/Supabase, per the original plan). Fine for now while iterating; worth revisiting before this is a real daily-driver.
+### Persistent memory (Turso)
+
+Conversation history is read/written through the [`libsql`](https://pypi.org/project/libsql/) Python package, which is drop-in DB-API-2.0-compatible with SQLite:
+
+- **`TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN` unset (default)** — falls back to a local file at `backend/data/memory.db` (gitignored). On Render's free tier this filesystem is ephemeral: the file is wiped on every deploy and periodically on restart, so conversations don't survive. Fine for local dev or quick experiments.
+- **Both set** — connects to a remote [Turso](https://turso.tech) database instead, which does survive redeploys and restarts.
+
+To set it up:
+1. Create a free account at [turso.tech](https://turso.tech) and a database (via their dashboard or `turso db create ailicious`).
+2. Get the URL (`turso db show ailicious --url`, looks like `libsql://ailicious-<org>.turso.io`) and an auth token (`turso db tokens create ailicious`).
+3. Set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` in Render's dashboard (or `.env` locally) — no code changes needed, no schema migration to run by hand. The same `CREATE TABLE IF NOT EXISTS` / idempotent `ALTER TABLE` logic that runs on every startup handles a fresh database or an existing one transparently.
 
 ### Deploy to Render
 
 1. Push this repo to GitHub and create a new **Blueprint** on [Render](https://render.com) pointing at it — it will pick up `render.yaml` automatically.
-2. Set the `MISTRAL_API_KEY` and `APP_API_KEY` environment variables in the Render dashboard (marked `sync: false` in the blueprint so they aren't committed).
+2. Set `MISTRAL_API_KEY` and `APP_API_KEY` in the Render dashboard (marked `sync: false` in the blueprint so they aren't committed). Optionally set `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN` too, per above, for memory that survives redeploys.
 3. Once deployed, verify with `curl https://<your-service>.onrender.com/health`.
 
 ### Next steps
 
-The original plan's phases are now all in place: cloud backend, remote inference, memory, personas, full agent swarm, and the Android/web client. From here it's iteration — durable memory (Turso/Supabase to survive Render redeploys), the KAIROS/SAGE self-improvement loops, and hardening (rate limiting, real auth beyond a shared API key) as this gets used for real.
+The original plan's phases are now all in place: cloud backend, remote inference, durable memory, personas, full agent swarm, and the Android/web client. From here it's iteration — the KAIROS/SAGE self-improvement loops, and hardening (rate limiting, real auth beyond a shared API key) as this gets used for real.
