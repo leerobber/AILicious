@@ -7,123 +7,231 @@
 <link rel="manifest" href="/manifest.json" />
 <link rel="icon" href="/icon-192.png" />
 <link rel="apple-touch-icon" href="/icon-192.png" />
-<meta name="theme-color" content="#0f172a" />
+<meta name="theme-color" content="#0b1220" />
 <style>
   :root {
     color-scheme: dark;
-    --bg: #0f172a;
-    --panel: #161f36;
+    --bg: #0b1220;
+    --bg-2: #0f1830;
+    --panel: rgba(22, 31, 54, 0.85);
     --panel-2: #1c2743;
-    --border: #2a3555;
-    --text: #e6ebf5;
-    --text-dim: #93a0c2;
+    --border: #29365a;
+    --text: #eef1f8;
+    --text-dim: #8d9ac2;
     --accent: #38bdf8;
-    --user-bubble: #1e3a8a;
-    --assistant-bubble: #1c2743;
-    --error: #f87171;
+    --agent-accent: #38bdf8;
+    --user-bubble-a: #3b82f6;
+    --user-bubble-b: #6366f1;
+    --assistant-bubble: #1a2543;
+    --error: #fb7185;
+    --success: #4ade80;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
   body {
     margin: 0;
-    background: var(--bg);
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     display: flex;
     flex-direction: column;
+    background:
+      radial-gradient(1200px 600px at 15% -10%, rgba(56, 189, 248, 0.12), transparent 60%),
+      radial-gradient(900px 500px at 110% 10%, rgba(167, 139, 250, 0.10), transparent 55%),
+      linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
+    background-attachment: fixed;
   }
+
   header {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 12px 16px;
-    padding-top: max(12px, env(safe-area-inset-top));
+    gap: 10px;
+    padding: 14px 16px;
+    padding-top: max(14px, env(safe-area-inset-top));
     border-bottom: 1px solid var(--border);
     background: var(--panel);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    position: sticky;
+    top: 0;
+    z-index: 5;
   }
   header h1 {
-    font-size: 16px;
+    font-size: 17px;
+    font-weight: 700;
     margin: 0;
     flex-shrink: 0;
+    letter-spacing: -0.01em;
+    background: linear-gradient(135deg, #93c5fd, #c4b5fd);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .agent-picker {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+  }
+  .agent-dot {
+    position: absolute;
+    left: 10px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--agent-accent);
+    box-shadow: 0 0 8px var(--agent-accent);
+    pointer-events: none;
+    transition: background 0.2s ease;
   }
   select#agent {
+    appearance: none;
+    -webkit-appearance: none;
     background: var(--panel-2);
     color: var(--text);
     border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 6px 8px;
+    border-radius: 10px;
+    padding: 8px 30px 8px 26px;
     font-size: 14px;
-    flex: 1;
-    min-width: 0;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    width: 100%;
+    transition: border-color 0.2s ease;
+  }
+  select#agent:focus { outline: none; border-color: var(--agent-accent); }
+  .agent-picker::after {
+    content: "";
+    position: absolute;
+    right: 12px;
+    width: 7px;
+    height: 7px;
+    border-right: 2px solid var(--text-dim);
+    border-bottom: 2px solid var(--text-dim);
+    transform: rotate(45deg);
+    pointer-events: none;
   }
   button.icon-btn {
     background: transparent;
     color: var(--text-dim);
     border: none;
-    font-size: 20px;
-    line-height: 1;
-    padding: 6px 8px;
+    padding: 6px;
     cursor: pointer;
-    border-radius: 8px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s ease, color 0.15s ease, transform 0.15s ease;
   }
   button.icon-btn:hover { background: var(--panel-2); color: var(--text); }
+  button.icon-btn:active { transform: scale(0.92); }
+  button.icon-btn svg { width: 20px; height: 20px; }
 
   main {
     flex: 1;
     overflow-y: auto;
-    padding: 16px;
+    padding: 18px 14px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 4px;
   }
+  .msg-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    max-width: 88%;
+    margin: 6px 0;
+    animation: rise 0.22s ease both;
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .msg-row.user { align-self: flex-end; flex-direction: row-reverse; }
+  .msg-row.assistant { align-self: flex-start; }
+  .msg-row.error { align-self: flex-start; max-width: 95%; }
+
+  .avatar {
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 700;
+    color: #04121f;
+    background: var(--agent-accent);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+  }
+
   .msg {
-    max-width: 85%;
     padding: 10px 14px;
-    border-radius: 14px;
+    border-radius: 16px;
     white-space: pre-wrap;
     word-wrap: break-word;
     font-size: 15px;
-    line-height: 1.4;
+    line-height: 1.45;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
   }
-  .msg.user {
-    align-self: flex-end;
-    background: var(--user-bubble);
-    border-bottom-right-radius: 4px;
+  .msg-row.user .msg {
+    background: linear-gradient(135deg, var(--user-bubble-a), var(--user-bubble-b));
+    color: #fff;
+    border-bottom-right-radius: 5px;
   }
-  .msg.assistant {
-    align-self: flex-start;
+  .msg-row.assistant .msg {
     background: var(--assistant-bubble);
-    border-bottom-left-radius: 4px;
+    border: 1px solid rgba(255, 255, 255, 0.04);
+    border-left: 3px solid var(--agent-accent);
+    border-bottom-left-radius: 5px;
   }
-  .msg.error {
-    align-self: flex-start;
-    background: transparent;
+  .msg-row.error .msg {
+    background: rgba(251, 113, 133, 0.08);
     border: 1px solid var(--error);
     color: var(--error);
+    border-radius: 12px;
+    font-size: 13.5px;
   }
-  .msg .agent-label {
-    display: block;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--text-dim);
-    margin-bottom: 4px;
+  .msg.pending { color: var(--text-dim); }
+  .pending-dots span {
+    display: inline-block;
+    width: 5px;
+    height: 5px;
+    margin-right: 3px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    animation: bounce 1.1s infinite ease-in-out;
   }
+  .pending-dots span:nth-child(2) { animation-delay: 0.15s; }
+  .pending-dots span:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes bounce {
+    0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
+    30% { transform: translateY(-4px); opacity: 1; }
+  }
+
   .empty-state {
     margin: auto;
     text-align: center;
     color: var(--text-dim);
     font-size: 14px;
     padding: 24px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
   }
+  .empty-state svg { width: 40px; height: 40px; opacity: 0.5; }
 
   form#composer {
     display: flex;
+    align-items: flex-end;
     gap: 8px;
     padding: 12px;
     padding-bottom: max(12px, env(safe-area-inset-bottom));
     border-top: 1px solid var(--border);
     background: var(--panel);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
   }
   textarea#input {
     flex: 1;
@@ -131,74 +239,112 @@
     background: var(--panel-2);
     color: var(--text);
     border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 10px 12px;
+    border-radius: 18px;
+    padding: 11px 16px;
     font-size: 15px;
     font-family: inherit;
     max-height: 120px;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
   }
-  textarea#input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  textarea#input:focus {
+    outline: none;
+    border-color: var(--agent-accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--agent-accent) 25%, transparent);
+  }
   button#send {
-    background: var(--accent);
-    color: #04263a;
+    background: var(--agent-accent);
+    color: #04121f;
     border: none;
-    border-radius: 12px;
-    padding: 0 18px;
-    font-size: 15px;
-    font-weight: 600;
+    border-radius: 50%;
+    width: 42px;
+    height: 42px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     cursor: pointer;
+    transition: transform 0.15s ease, filter 0.15s ease;
   }
-  button#send:disabled { opacity: 0.5; cursor: default; }
+  button#send svg { width: 19px; height: 19px; }
+  button#send:hover:not(:disabled) { filter: brightness(1.1); }
+  button#send:active:not(:disabled) { transform: scale(0.92); }
+  button#send:disabled { opacity: 0.4; cursor: default; }
 
   dialog#settings {
-    background: var(--panel);
+    background: #141c33;
     color: var(--text);
     border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 20px;
+    border-radius: 16px;
+    padding: 22px;
     max-width: 360px;
     width: calc(100% - 32px);
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
   }
-  dialog#settings::backdrop { background: rgba(0, 0, 0, 0.6); }
-  dialog#settings h2 { margin-top: 0; font-size: 16px; }
+  dialog#settings::backdrop { background: rgba(4, 8, 20, 0.7); backdrop-filter: blur(2px); }
+  dialog#settings h2 { margin-top: 0; font-size: 17px; }
   dialog#settings label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 6px; }
   dialog#settings input[type="password"] {
     width: 100%;
     background: var(--panel-2);
     color: var(--text);
     border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 8px 10px;
+    border-radius: 10px;
+    padding: 10px 12px;
     font-size: 14px;
-    margin-bottom: 16px;
+    margin-bottom: 10px;
+    transition: border-color 0.15s ease;
   }
+  dialog#settings input[type="password"]:focus { outline: none; border-color: var(--accent); }
   dialog#settings .row { display: flex; gap: 8px; justify-content: flex-end; }
   dialog#settings button {
     border: none;
-    border-radius: 8px;
-    padding: 8px 14px;
+    border-radius: 10px;
+    padding: 9px 15px;
     font-size: 14px;
     cursor: pointer;
+    transition: filter 0.15s ease, transform 0.1s ease;
   }
+  dialog#settings button:active { transform: scale(0.96); }
   dialog#settings button.save { background: var(--accent); color: #04263a; font-weight: 600; }
+  dialog#settings button.save:hover { filter: brightness(1.08); }
   dialog#settings button.danger { background: transparent; color: var(--error); }
+  dialog#settings button.danger:hover { background: rgba(251, 113, 133, 0.1); }
   dialog#settings button.cancel { background: var(--panel-2); color: var(--text); }
+  dialog#settings button.cancel:hover { filter: brightness(1.2); }
 </style>
 </head>
 <body>
   <header>
     <h1>AILicious</h1>
-    <select id="agent"></select>
-    <button class="icon-btn" id="settings-btn" title="Settings" aria-label="Settings">&#9881;</button>
+    <div class="agent-picker">
+      <span class="agent-dot" id="agent-dot"></span>
+      <select id="agent"></select>
+    </div>
+    <button class="icon-btn" id="settings-btn" title="Settings" aria-label="Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+      </svg>
+    </button>
   </header>
 
   <main id="messages">
-    <div class="empty-state" id="empty-state">Pick an agent above and say hello.</div>
+    <div class="empty-state" id="empty-state">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path>
+      </svg>
+      <span>Pick an agent above and say hello.</span>
+    </div>
   </main>
 
   <form id="composer">
     <textarea id="input" rows="1" placeholder="Message..." autocomplete="off"></textarea>
-    <button id="send" type="submit">Send</button>
+    <button id="send" type="submit" aria-label="Send">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="22" y1="2" x2="11" y2="13"></line>
+        <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+      </svg>
+    </button>
   </form>
 
   <dialog id="settings">
@@ -213,7 +359,7 @@
       autocorrect="off"
       spellcheck="false"
     />
-    <div id="key-status" style="font-size: 13px; margin: -10px 0 16px; min-height: 16px;"></div>
+    <div id="key-status" style="font-size: 13px; margin: 0 0 16px; min-height: 16px;"></div>
     <div class="row">
       <button type="button" class="danger" id="clear-history">Clear this agent's chat</button>
     </div>
@@ -225,11 +371,20 @@
 
   <script>
     const AGENTS = ["nexus", "forge", "oracle", "sentinel", "codex", "avery"];
+    const AGENT_COLORS = {
+      nexus: "#38bdf8",
+      forge: "#fb923c",
+      oracle: "#c084fc",
+      sentinel: "#fb7185",
+      codex: "#34d399",
+      avery: "#fbbf24",
+    };
     const API_BASE = window.location.origin;
 
     const messagesEl = document.getElementById("messages");
     const emptyStateEl = document.getElementById("empty-state");
     const agentSelect = document.getElementById("agent");
+    const agentDot = document.getElementById("agent-dot");
     const composerForm = document.getElementById("composer");
     const inputEl = document.getElementById("input");
     const sendBtn = document.getElementById("send");
@@ -239,6 +394,7 @@
     const settingsSave = document.getElementById("settings-save");
     const settingsCancel = document.getElementById("settings-cancel");
     const clearHistoryBtn = document.getElementById("clear-history");
+    const keyStatusEl = document.getElementById("key-status");
 
     function storageKey(agent, suffix) {
       return `ailicious_${suffix}_${agent}`;
@@ -276,12 +432,36 @@
       return agentSelect.value;
     }
 
+    function applyAgentAccent(agent) {
+      const color = AGENT_COLORS[agent] || AGENT_COLORS.nexus;
+      document.documentElement.style.setProperty("--agent-accent", color);
+    }
+
     function renderMessage(role, content) {
-      const div = document.createElement("div");
-      div.className = `msg ${role}`;
-      div.textContent = content;
-      messagesEl.appendChild(div);
-      return div;
+      const row = document.createElement("div");
+      row.className = `msg-row ${role}`;
+
+      if (role === "assistant") {
+        const avatar = document.createElement("div");
+        avatar.className = "avatar";
+        avatar.textContent = currentAgent().charAt(0).toUpperCase();
+        row.appendChild(avatar);
+      }
+
+      const bubble = document.createElement("div");
+      bubble.className = "msg";
+      bubble.textContent = content;
+      row.appendChild(bubble);
+
+      messagesEl.appendChild(row);
+      return bubble;
+    }
+
+    function renderPending() {
+      const bubble = renderMessage("assistant", "");
+      bubble.classList.add("pending");
+      bubble.innerHTML = '<span class="pending-dots"><span></span><span></span><span></span></span>';
+      return bubble;
     }
 
     function renderHistory(agent) {
@@ -309,14 +489,14 @@
         agentSelect.appendChild(opt);
       }
       agentSelect.value = localStorage.getItem("ailicious_last_agent") || "nexus";
+      applyAgentAccent(agentSelect.value);
     }
 
     agentSelect.addEventListener("change", () => {
       localStorage.setItem("ailicious_last_agent", currentAgent());
+      applyAgentAccent(currentAgent());
       renderHistory(currentAgent());
     });
-
-    const keyStatusEl = document.getElementById("key-status");
 
     function setKeyStatus(text, color) {
       keyStatusEl.textContent = text;
@@ -341,7 +521,7 @@
       try {
         const resp = await fetch(`${API_BASE}/agents`, { headers: { "X-API-Key": key } });
         if (resp.ok) {
-          setKeyStatus("✓ Key works — saved.", "#4ade80");
+          setKeyStatus("✓ Key works — saved.", "var(--success)");
           setTimeout(() => settingsDialog.close(), 700);
         } else if (resp.status === 401) {
           setKeyStatus("✗ Server rejected this key (401). Check for typos or extra spaces.", "var(--error)");
@@ -399,7 +579,7 @@
       scrollToBottom();
 
       sendBtn.disabled = true;
-      const pending = renderMessage("assistant", "...");
+      const pending = renderPending();
       scrollToBottom();
 
       try {
@@ -415,20 +595,21 @@
         const data = await resp.json();
 
         if (!resp.ok) {
-          pending.remove();
+          pending.parentElement.remove();
           renderMessage("error", data.detail || `Request failed (${resp.status})`);
           scrollToBottom();
           return;
         }
 
         setSessionId(agent, data.session_id);
+        pending.classList.remove("pending");
         pending.textContent = data.response;
 
         const updatedHistory = getHistory(agent);
         updatedHistory.push({ role: "assistant", content: data.response });
         setHistory(agent, updatedHistory);
       } catch (err) {
-        pending.remove();
+        pending.parentElement.remove();
         renderMessage("error", `Network error: ${err.message}`);
       } finally {
         sendBtn.disabled = false;
