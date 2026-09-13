@@ -23,7 +23,13 @@ Both chat endpoints accept an optional `session_id`; when included, the last 20 
 
 Both chat endpoints are also rate-limited (default 20 requests/minute, per API key — or per client IP locally if `APP_API_KEY` is unset) and cap message length (default 4000 characters), to keep a leaked key or a client bug from running up unbounded Mistral usage. Tune via `RATE_LIMIT_PER_MINUTE` and `MAX_MESSAGE_LENGTH`; exceeding either returns a normal error the PWA already displays inline (429 with a `Retry-After` header, or 400).
 
-Every chat response includes a `message_id`; `POST /feedback` (`{message_id, rating}`, rating `1` or `-1`) records a thumbs up/down on that specific reply. The PWA shows this as small thumb icons under each assistant message — the first step toward KAIROS (see below), since utility scoring needs a real signal, not just heuristics.
+Every chat response includes a `message_id`; `POST /feedback` (`{message_id, rating}`, rating `1` or `-1`) records a thumbs up/down on that specific reply. The PWA shows this as small thumb icons under each assistant message, feeding into KAIROS below.
+
+### KAIROS (utility-weighted memory retrieval)
+
+Every stored message carries a `utility_score`, seeded at write time by a small heuristic (longer, more substantive turns score slightly higher, capped so a wall of text doesn't dominate) and nudged by feedback (`+2.0` on a thumbs up, `-2.0` on a thumbs down, applied as a delta so re-voting or switching a vote never double-counts). `get_history` uses this score to let a genuinely valuable older message survive in context over worthless-but-recent filler, instead of always dropping to a flat recency window — it pulls a larger recency-ordered candidate pool, ranks by recency + utility, takes the top N, then re-sorts back into chronological order so the transcript the model sees still reads naturally.
+
+This isn't a scheduled background job — Render's free tier has no free cron, and the service sleeps when idle anyway — so KAIROS is inline scoring computed synchronously at write/read time. When nothing has any feedback yet (the common case for a new or quiet agent), ranking collapses to exactly what a plain `ORDER BY id DESC LIMIT` would return — zero behavior change until real signal exists.
 
 ### Run locally
 
@@ -72,7 +78,7 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-Covers persona loading, memory (round-trips, per-agent/per-session isolation, the schema-migration guard), rate limiting, and the API layer end to end (auth, 404s, the length cap, the 429 path, and — the one that matters most — that one agent's conversation never leaks into another's outgoing request to Mistral, checked by inspecting the mocked request payload itself rather than just row counts). The Mistral call is mocked so tests run offline with no API key or network access needed; everything else exercises real code paths, including a real local `libsql` database per test.
+Covers persona loading, memory (round-trips, per-agent/per-session isolation, the schema-migration guard, KAIROS's utility-weighted ranking — including a case a plain-recency implementation would get wrong), rate limiting, and the API layer end to end (auth, 404s, the length cap, the 429 path, and — the one that matters most — that one agent's conversation never leaks into another's outgoing request to Mistral, checked by inspecting the mocked request payload itself rather than just row counts). The Mistral call is mocked so tests run offline with no API key or network access needed; everything else exercises real code paths, including a real local `libsql` database per test.
 
 Runs automatically on every PR and push to `main` via `.github/workflows/ci.yml`.
 
@@ -98,4 +104,4 @@ To set it up:
 
 The original plan's phases are now all in place: cloud backend, remote inference, durable memory, personas, full agent swarm, the Android/web client, basic hardening (rate limiting, message-length caps), and a CI-backed test suite.
 
-KAIROS/SAGE — the self-improvement loops from the original blueprint — are underway, shipped as incremental steps: feedback capture (this PR) is the first, followed by utility-weighted memory retrieval (KAIROS) and an on-demand persona-evolution proposal-and-approval flow (SAGE). Neither is a scheduled background worker — Render's free tier doesn't support that without cost, and the service sleeps when idle anyway — so KAIROS is inline scoring computed at write/read time, and SAGE is triggered on demand rather than autonomously. Eventually, real per-user auth if this is ever used by more than one person, rather than a single shared API key.
+KAIROS/SAGE — the self-improvement loops from the original blueprint — are underway, shipped as incremental steps: feedback capture and utility-weighted memory retrieval (KAIROS, this PR) are done, followed by an on-demand persona-evolution proposal-and-approval flow (SAGE). Neither is a scheduled background worker — Render's free tier doesn't support that without cost, and the service sleeps when idle anyway — so KAIROS is inline scoring computed at write/read time, and SAGE will be triggered on demand rather than autonomously. Eventually, real per-user auth if this is ever used by more than one person, rather than a single shared API key.
