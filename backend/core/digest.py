@@ -34,10 +34,23 @@ DIGEST_SYSTEM_PROMPT = (
     "exchanges since that summary was last updated. Merge them into an updated summary: "
     "keep what's still true, revise anything the new exchanges corrected, add what's "
     "genuinely new, and drop anything now irrelevant. Keep it dense and factual -- key "
-    "facts, decisions, stated preferences, and open threads, not a transcript. Respond "
-    "with ONLY a JSON object: "
+    "facts, decisions, stated preferences, and open threads, not a transcript.\n\n"
+    "Also infer, from the user's own behavior rather than any explicit rating, what "
+    "worked and what didn't. Concretely: the user rephrasing or re-asking a question "
+    "signals the prior answer missed the mark; an explicit correction ('no, I meant...', "
+    "'that's wrong') is a strong negative signal; building directly on an answer, reusing "
+    "it, or affirming it ('exactly', 'perfect', 'that works') is a strong positive signal; "
+    "silently moving to a new topic is weak/neutral. A message explicitly tagged [user "
+    "liked this] or [user disliked this] is a strong, direct signal -- weight it heavily "
+    "when present, but most turns won't have one, so infer from behavior instead. "
+    "Summarize this as a short, concrete note: what kind of response this user responds "
+    "well to, and what to avoid -- not a running tally, an actionable read. Leave it empty "
+    "if nothing in this batch of exchanges is informative either way.\n\n"
+    "Respond with ONLY a JSON object: "
     '{"digest": "<the updated summary>", "topic_shift": <true if the new exchanges moved '
-    'to a substantially different subject than what came before, else false>}. '
+    'to a substantially different subject than what came before, else false>, '
+    '"signal_quality": "<the inferred read on what worked/didn\'t, merged with anything '
+    'already known -- or \\"\\" if nothing new to add>"}. '
     "No markdown, no extra text -- valid JSON only."
 )
 
@@ -59,10 +72,15 @@ def init_db() -> None:
                     last_message_at TEXT,
                     last_digested_at TEXT,
                     consecutive_failures INTEGER NOT NULL DEFAULT 0,
-                    topic_shift_pending INTEGER NOT NULL DEFAULT 0
+                    topic_shift_pending INTEGER NOT NULL DEFAULT 0,
+                    signal_quality TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
+            try:
+                conn.execute("ALTER TABLE conversation_digests ADD COLUMN signal_quality TEXT NOT NULL DEFAULT ''")
+            except ValueError:
+                pass  # column already exists (fresh table, or already migrated)
             conn.commit()
         finally:
             conn.close()
@@ -77,6 +95,7 @@ def _row_to_state(row) -> dict:
         "last_digested_at": row[4],
         "consecutive_failures": row[5],
         "topic_shift_pending": bool(row[6]),
+        "signal_quality": row[7],
     }
 
 
@@ -86,13 +105,14 @@ def get_state(agent: str) -> dict:
         try:
             row = conn.execute(
                 "SELECT agent, digest, turns_since_digest, last_message_at, last_digested_at, "
-                "consecutive_failures, topic_shift_pending FROM conversation_digests WHERE agent = ?",
+                "consecutive_failures, topic_shift_pending, signal_quality FROM conversation_digests "
+                "WHERE agent = ?",
                 (agent,),
             ).fetchone()
             if row is None:
                 conn.execute("INSERT INTO conversation_digests (agent) VALUES (?)", (agent,))
                 conn.commit()
-                row = (agent, "", 0, None, None, 0, 0)
+                row = (agent, "", 0, None, None, 0, 0, "")
         finally:
             conn.close()
     return _row_to_state(row)
@@ -161,15 +181,15 @@ def release(agent: str) -> None:
         _active_agents.discard(agent)
 
 
-def apply_digest(agent: str, new_digest: str, topic_shift: bool) -> None:
+def apply_digest(agent: str, new_digest: str, topic_shift: bool, signal_quality: str = "") -> None:
     with _lock:
         conn = _get_connection()
         try:
             conn.execute("INSERT OR IGNORE INTO conversation_digests (agent) VALUES (?)", (agent,))
             conn.execute(
                 "UPDATE conversation_digests SET digest = ?, turns_since_digest = 0, last_digested_at = ?, "
-                "consecutive_failures = 0, topic_shift_pending = ? WHERE agent = ?",
-                (new_digest, datetime.now(timezone.utc).isoformat(), int(topic_shift), agent),
+                "consecutive_failures = 0, topic_shift_pending = ?, signal_quality = ? WHERE agent = ?",
+                (new_digest, datetime.now(timezone.utc).isoformat(), int(topic_shift), signal_quality, agent),
             )
             conn.commit()
         finally:
@@ -190,8 +210,13 @@ def record_failure(agent: str) -> None:
             conn.close()
 
 
-def _build_digest_messages(prior_digest: str, new_turns: list[dict]) -> list[dict]:
+def _build_digest_messages(prior_digest: str, new_turns: list[dict], prior_signal_quality: str = "") -> list[dict]:
     lines = [f"What you currently know:\n{prior_digest}" if prior_digest else "You don't know anything about this user yet."]
+    lines.append(
+        f"\nWhat you've already learned about what this user responds well/poorly to:\n{prior_signal_quality}"
+        if prior_signal_quality
+        else "\nNo read yet on what this user responds well or poorly to."
+    )
     lines.append("\nNew exchanges since then:")
     for turn in new_turns:
         tag = ""
@@ -221,7 +246,7 @@ async def run_digest_cycle(agent: str, call_mistral) -> bool:
         if not new_turns:
             return False
 
-        messages = _build_digest_messages(state["digest"], new_turns)
+        messages = _build_digest_messages(state["digest"], new_turns, state["signal_quality"])
         try:
             raw_reply = await call_mistral(messages)
             parsed = json.loads(raw_reply)
@@ -229,11 +254,14 @@ async def run_digest_cycle(agent: str, call_mistral) -> bool:
             topic_shift = bool(parsed.get("topic_shift", False))
             if not isinstance(new_digest, str):
                 raise ValueError("digest must be a string")
+            signal_quality = parsed.get("signal_quality", state["signal_quality"])
+            if not isinstance(signal_quality, str):
+                signal_quality = state["signal_quality"]
         except Exception:
             await asyncio.to_thread(record_failure, agent)
             return False
 
-        await asyncio.to_thread(apply_digest, agent, new_digest, topic_shift)
+        await asyncio.to_thread(apply_digest, agent, new_digest, topic_shift, signal_quality)
         return True
     finally:
         release(agent)

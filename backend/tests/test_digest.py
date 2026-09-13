@@ -31,6 +31,7 @@ def test_get_state_defaults_for_unknown_agent():
         "last_digested_at": None,
         "consecutive_failures": 0,
         "topic_shift_pending": False,
+        "signal_quality": "",
     }
 
 
@@ -124,7 +125,7 @@ def test_apply_digest_resets_turns_and_failures():
     digest_module.note_turns("nexus", 5)
     digest_module.record_failure("nexus")
 
-    digest_module.apply_digest("nexus", "the new digest", topic_shift=True)
+    digest_module.apply_digest("nexus", "the new digest", topic_shift=True, signal_quality="prefers brevity")
 
     state = digest_module.get_state("nexus")
     assert state["digest"] == "the new digest"
@@ -132,6 +133,13 @@ def test_apply_digest_resets_turns_and_failures():
     assert state["consecutive_failures"] == 0
     assert state["topic_shift_pending"] is True
     assert state["last_digested_at"] is not None
+    assert state["signal_quality"] == "prefers brevity"
+
+
+def test_apply_digest_signal_quality_defaults_to_empty():
+    digest_module.apply_digest("nexus", "the new digest", topic_shift=False)
+
+    assert digest_module.get_state("nexus")["signal_quality"] == ""
 
 
 def test_record_failure_increments_consecutive_failures():
@@ -158,6 +166,60 @@ def test_run_digest_cycle_applies_a_valid_merged_digest():
     state = digest_module.get_state("nexus")
     assert state["digest"] == "User's favorite color is teal."
     assert state["turns_since_digest"] == 0
+
+
+def test_run_digest_cycle_stores_inferred_signal_quality():
+    memory_module.add_message("s1", "nexus", "user", "explain X")
+    memory_module.add_message("s1", "nexus", "assistant", "a long rambling answer")
+    memory_module.add_message("s1", "nexus", "user", "no, simpler please")
+
+    async def fake_call_mistral(messages):
+        return json.dumps(
+            {
+                "digest": "Asked about X.",
+                "topic_shift": False,
+                "signal_quality": "Prefers short, simple answers over long ones.",
+            }
+        )
+
+    result = _run(digest_module.run_digest_cycle("nexus", fake_call_mistral))
+
+    assert result is True
+    assert digest_module.get_state("nexus")["signal_quality"] == "Prefers short, simple answers over long ones."
+
+
+def test_run_digest_cycle_missing_signal_quality_keeps_prior_value():
+    digest_module.apply_digest("nexus", "prior digest", topic_shift=False, signal_quality="likes code examples")
+    memory_module.add_message("s1", "nexus", "user", "another message")
+
+    async def fake_call_mistral(messages):
+        return json.dumps({"digest": "updated digest", "topic_shift": False})
+
+    result = _run(digest_module.run_digest_cycle("nexus", fake_call_mistral))
+
+    assert result is True
+    assert digest_module.get_state("nexus")["signal_quality"] == "likes code examples"
+
+
+def test_run_digest_cycle_non_string_signal_quality_keeps_prior_value():
+    digest_module.apply_digest("nexus", "prior digest", topic_shift=False, signal_quality="likes code examples")
+    memory_module.add_message("s1", "nexus", "user", "another message")
+
+    async def fake_call_mistral(messages):
+        return json.dumps({"digest": "updated digest", "topic_shift": False, "signal_quality": 12345})
+
+    result = _run(digest_module.run_digest_cycle("nexus", fake_call_mistral))
+
+    assert result is True
+    assert digest_module.get_state("nexus")["signal_quality"] == "likes code examples"
+
+
+def test_build_digest_messages_includes_prior_signal_quality():
+    messages = digest_module._build_digest_messages(
+        "prior digest", [{"role": "user", "content": "hi", "feedback": None}], "prefers brevity"
+    )
+
+    assert "prefers brevity" in messages[1]["content"]
 
 
 def test_run_digest_cycle_no_new_turns_is_a_noop():
