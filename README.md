@@ -4,14 +4,14 @@ Personality-driven, multi-agent AI system with cloud-based inference and memory,
 
 ## Backend (Phase 1: minimal walking skeleton)
 
-A single-route FastAPI service that proxies chat messages to Groq. This is step one of the build-out: prove the deploy + provider integration before adding agents, persona, and memory.
+A single-route FastAPI service that proxies chat messages to Mistral. This is step one of the build-out: prove the deploy + provider integration before adding agents, persona, and memory.
 
 ### Run locally
 
 ```bash
 cd backend
 pip install -r requirements.txt
-cp .env.example .env   # fill in GROQ_API_KEY; get one free at https://console.groq.com
+cp .env.example .env   # fill in MISTRAL_API_KEY from https://console.mistral.ai
 export $(cat .env | xargs)
 uvicorn main:app --reload
 ```
@@ -31,7 +31,7 @@ curl -X POST http://127.0.0.1:8000/chat \
 ### Deploy to Render
 
 1. Push this repo to GitHub and create a new **Blueprint** on [Render](https://render.com) pointing at it — it will pick up `render.yaml` automatically.
-2. Set the `GROQ_API_KEY` and `APP_API_KEY` environment variables in the Render dashboard (marked `sync: false` in the blueprint so they aren't committed).
+2. Set the `MISTRAL_API_KEY` and `APP_API_KEY` environment variables in the Render dashboard (marked `sync: false` in the blueprint so they aren't committed).
 3. Once deployed, verify with `curl https://<your-service>.onrender.com/health`.
 
 ### Next steps
