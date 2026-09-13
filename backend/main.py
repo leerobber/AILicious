@@ -3,6 +3,7 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -10,7 +11,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from core.memory import add_message, get_feedback_examples, get_history, get_stats, init_db, set_feedback
+from core.digest import get_digest_text, note_turns, run_digest_cycle, should_digest
+from core.digest import init_db as init_digest_db
+from core.memory import add_message, get_history, get_stats, init_db, set_feedback
 from core.persona import get_system_prompt, has_persona, list_personas, load_personas
 from core.persona_overrides import clear_override, get_override, set_override
 from core.persona_overrides import init_db as init_persona_overrides_db
@@ -22,10 +25,12 @@ MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 MISTRAL_MODEL = os.environ.get("MISTRAL_MODEL", "mistral-small-latest")
 APP_API_KEY = os.environ.get("APP_API_KEY")
-HISTORY_LIMIT = 20
+RECENT_TAIL_LIMIT = 6  # short raw window; the conversation digest carries the rest
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "20"))
 MAX_MESSAGE_LENGTH = int(os.environ.get("MAX_MESSAGE_LENGTH", "4000"))
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+_background_tasks: set[asyncio.Task] = set()
 
 
 @asynccontextmanager
@@ -33,6 +38,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(init_db)
     await asyncio.to_thread(init_persona_overrides_db)
     await asyncio.to_thread(init_sage_proposals_db)
+    await asyncio.to_thread(init_digest_db)
     await asyncio.to_thread(load_personas)
     yield
 
@@ -98,6 +104,20 @@ async def _call_mistral(messages: list[dict]) -> str:
     return data["choices"][0]["message"]["content"]
 
 
+def _schedule_digest(agent: str) -> None:
+    """Fires a digest cycle in the background -- never awaited by the request that
+    triggers it, so it adds zero latency to the chat response. A module-level set
+    keeps a reference to the task so it isn't garbage-collected mid-run.
+    """
+    task = asyncio.create_task(_run_digest_safely(agent))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _run_digest_safely(agent: str) -> None:
+    await run_digest_cycle(agent, _call_mistral)
+
+
 async def run_agent_chat(agent: str, message: str, session_id: str | None) -> ChatResponse:
     if len(message) > MAX_MESSAGE_LENGTH:
         raise HTTPException(
@@ -106,39 +126,55 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
         )
 
     session_id = session_id or str(uuid.uuid4())
+    request_started_at = datetime.now(timezone.utc).isoformat()
 
-    history = await asyncio.to_thread(get_history, session_id, agent, HISTORY_LIMIT)
+    recent_tail = await asyncio.to_thread(get_history, session_id, agent, RECENT_TAIL_LIMIT)
+    digest_text = await asyncio.to_thread(get_digest_text, agent)
     override = await asyncio.to_thread(get_override, agent)
     system_prompt = override if override is not None else get_system_prompt(agent)
-    messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": message}]
+
+    messages = [{"role": "system", "content": system_prompt}]
+    if digest_text:
+        messages.append({"role": "system", "content": f"What you know about this user so far:\n{digest_text}"})
+    messages += recent_tail + [{"role": "user", "content": message}]
 
     reply = await _call_mistral(messages)
 
     await asyncio.to_thread(add_message, session_id, agent, "user", message)
     message_id = await asyncio.to_thread(add_message, session_id, agent, "assistant", reply)
 
+    # Bookkeeping for the next digest cycle -- note_turns compares request_started_at
+    # (captured before the Mistral call) against the *previous* exchange's timestamp,
+    # so a slow reply from Mistral this turn never gets mistaken for a conversational
+    # pause on the user's part.
+    pause_triggered = await asyncio.to_thread(note_turns, agent, 2, request_started_at)
+    if pause_triggered or await asyncio.to_thread(should_digest, agent):
+        _schedule_digest(agent)
+
     return ChatResponse(response=reply, session_id=session_id, agent=agent, message_id=message_id)
 
 
 SAGE_ANALYSIS_SYSTEM_PROMPT = (
     "You are SAGE, a persona-tuning assistant for an AI agent platform. You will be shown an "
-    "agent's current system prompt and a set of past exchanges the agent had, each marked with "
-    "user feedback (liked or disliked). Propose a revised system prompt that reinforces what "
-    "earned positive feedback and steers away from what earned negative feedback, while "
-    "preserving the agent's core identity and role. Respond with ONLY a JSON object of the form "
+    "agent's current system prompt and a synthesized summary of what the agent has learned "
+    "about its user across every conversation -- their goals, preferences, corrections "
+    "they've made, and recurring patterns. Propose a revised system prompt that better serves "
+    "this user based on that summary, while preserving the agent's core identity and role. "
+    "Respond with ONLY a JSON object of the form "
     '{"rationale": "<one paragraph explaining the change>", '
     '"proposed_system_prompt": "<the full revised system prompt>"}. '
     "No markdown, no code fences, no extra text — valid JSON only."
 )
 
 
-def _build_sage_analysis_messages(agent: str, current_system_prompt: str, examples: list[dict]) -> list[dict]:
-    lines = [f"Current system prompt for '{agent}':", current_system_prompt, "", "Past exchanges with feedback:"]
-    for example in examples:
-        verdict = "liked" if example["feedback"] == 1 else "disliked"
-        lines.append(
-            f"- [{verdict}] User: {example['user_message']!r} -> Assistant: {example['assistant_reply']!r}"
-        )
+def _build_sage_analysis_messages(agent: str, current_system_prompt: str, digest: str) -> list[dict]:
+    lines = [
+        f"Current system prompt for '{agent}':",
+        current_system_prompt,
+        "",
+        "What this agent has learned about its user, synthesized from every conversation:",
+        digest,
+    ]
     return [
         {"role": "system", "content": SAGE_ANALYSIS_SYSTEM_PROMPT},
         {"role": "user", "content": "\n".join(lines)},
@@ -218,14 +254,16 @@ async def sage_analyze(agent: str, x_api_key: str | None = Header(default=None))
     if not has_persona(agent):
         raise HTTPException(status_code=404, detail=f"Unknown agent '{agent}'. Available: {list_personas()}")
 
-    examples = await asyncio.to_thread(get_feedback_examples, agent, 50)
-    if not examples:
-        raise HTTPException(status_code=400, detail=f"No feedback recorded yet for agent '{agent}' to analyze.")
+    digest_text = await asyncio.to_thread(get_digest_text, agent)
+    if not digest_text:
+        raise HTTPException(
+            status_code=400, detail=f"No conversation digest yet for agent '{agent}' -- chat with it a bit first."
+        )
 
     override = await asyncio.to_thread(get_override, agent)
     current_system_prompt = override if override is not None else get_system_prompt(agent)
 
-    messages = _build_sage_analysis_messages(agent, current_system_prompt, examples)
+    messages = _build_sage_analysis_messages(agent, current_system_prompt, digest_text)
     raw_reply = await _call_mistral(messages)
 
     try:

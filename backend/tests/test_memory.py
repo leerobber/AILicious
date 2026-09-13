@@ -71,76 +71,41 @@ def test_history_respects_limit_and_chronological_order():
     assert [m["content"] for m in history] == ["msg2", "msg3", "msg4"]
 
 
-def test_high_utility_message_survives_over_recent_filler():
-    # 25 short (near-zero heuristic score) messages; a plain recency LIMIT of 20 would
-    # keep only the newest 20, dropping the oldest 5 (msg0..msg4).
-    ids = [memory_module.add_message("s1", "nexus", "user", f"msg{i}") for i in range(25)]
+def test_get_messages_since_none_returns_everything_for_the_agent():
+    memory_module.add_message("s1", "nexus", "user", "a")
+    memory_module.add_message("s2", "nexus", "assistant", "b")
+    memory_module.add_message("s1", "forge", "user", "not nexus")
 
-    # Upvote the message that would otherwise be the very first one dropped, boosting
-    # its utility_score enough to outrank plain recency.
-    memory_module.set_feedback(ids[0], 1)
+    messages = memory_module.get_messages_since("nexus", None)
 
-    history = memory_module.get_history("s1", "nexus", limit=20)
-    contents = [m["content"] for m in history]
-
-    assert "msg0" in contents  # survived despite being older than the recency cutoff
-    assert len(contents) == 20
-    assert contents == sorted(contents, key=lambda c: int(c.removeprefix("msg")))  # still chronological
+    assert [m["content"] for m in messages] == ["a", "b"]
 
 
-def test_zero_utility_history_matches_plain_recency():
-    # No feedback anywhere: KAIROS's ranking must collapse to exactly what a bare
-    # `ORDER BY id DESC LIMIT` would return — no behavior change for the common case.
-    for i in range(25):
-        memory_module.add_message("s1", "nexus", "user", f"msg{i}")
+def test_get_messages_since_timestamp_excludes_earlier_messages():
+    import libsql
 
-    history = memory_module.get_history("s1", "nexus", limit=20)
-    contents = [m["content"] for m in history]
+    memory_module.add_message("s1", "nexus", "user", "old")
 
-    assert contents == [f"msg{i}" for i in range(5, 25)]
+    conn = libsql.connect(str(memory_module.DB_PATH))
+    boundary = conn.execute("SELECT created_at FROM messages ORDER BY id DESC LIMIT 1").fetchone()[0]
+    conn.close()
 
+    memory_module.add_message("s1", "nexus", "user", "new")
 
-def test_get_feedback_examples_returns_empty_list_when_no_feedback():
-    memory_module.add_message("s1", "nexus", "user", "hello")
-    memory_module.add_message("s1", "nexus", "assistant", "hi there")
+    messages = memory_module.get_messages_since("nexus", boundary)
 
-    assert memory_module.get_feedback_examples("nexus") == []
+    assert [m["content"] for m in messages] == ["new"]
 
 
-def test_get_feedback_examples_pairs_user_and_assistant_messages():
-    memory_module.add_message("s1", "nexus", "user", "what's the weather?")
-    assistant_id = memory_module.add_message("s1", "nexus", "assistant", "sunny and warm")
-    memory_module.set_feedback(assistant_id, 1)
+def test_get_messages_since_spans_sessions_and_includes_feedback():
+    id1 = memory_module.add_message("s1", "nexus", "user", "q")
+    memory_module.add_message("s2", "nexus", "assistant", "a")
+    memory_module.set_feedback(id1, 1)
 
-    examples = memory_module.get_feedback_examples("nexus")
+    messages = memory_module.get_messages_since("nexus", None)
 
-    assert examples == [{"user_message": "what's the weather?", "assistant_reply": "sunny and warm", "feedback": 1}]
-
-
-def test_get_feedback_examples_only_includes_feedback_messages_most_recent_first():
-    memory_module.add_message("s1", "nexus", "user", "q1")
-    id1 = memory_module.add_message("s1", "nexus", "assistant", "a1")
-    memory_module.add_message("s1", "nexus", "user", "q2")
-    id2 = memory_module.add_message("s1", "nexus", "assistant", "a2")
-    memory_module.add_message("s1", "nexus", "user", "q3")
-    memory_module.add_message("s1", "nexus", "assistant", "a3")  # no feedback, excluded
-
-    memory_module.set_feedback(id1, -1)
-    memory_module.set_feedback(id2, 1)
-
-    examples = memory_module.get_feedback_examples("nexus")
-
-    assert [e["assistant_reply"] for e in examples] == ["a2", "a1"]
-    assert [e["feedback"] for e in examples] == [1, -1]
-
-
-def test_get_feedback_examples_scoped_per_agent():
-    memory_module.add_message("s1", "forge", "user", "q")
-    forge_reply_id = memory_module.add_message("s1", "forge", "assistant", "forge reply")
-    memory_module.set_feedback(forge_reply_id, 1)
-
-    assert memory_module.get_feedback_examples("oracle") == []
-    assert len(memory_module.get_feedback_examples("forge")) == 1
+    assert messages[0]["feedback"] == 1
+    assert messages[1]["feedback"] is None
 
 
 def test_get_stats():
