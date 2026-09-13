@@ -10,6 +10,7 @@ Client-side notes:
 - The API key is stored in the browser's `localStorage`, sent only as an `X-API-Key` header to this same-origin backend — never committed, never sent anywhere else.
 - Each agent gets its own `session_id` and message history in `localStorage`, matching the backend's per-agent memory scoping — switching agents shows that agent's own conversation, not a mixed one.
 - Verified end to end with a real browser (Playwright): entering a key, picking an agent, sending a message, and getting back a real Mistral-backed reply, plus confirming history correctly persists per agent when switching back and forth.
+- A **SAGE panel** (Settings → "Persona (SAGE)") lets you trigger feedback analysis, review/accept/reject proposals, and reset an agent's persona — all from the phone, no API calls by hand. See SAGE below.
 
 ## Backend (Phase 1: minimal walking skeleton)
 
@@ -48,7 +49,7 @@ SAGE proposes revisions itself, on demand, from real feedback:
 - `POST /sage/proposals/{id}/reject` — marks it `rejected`; the override table is untouched.
 - Both transitions only apply to a `pending` proposal — acting on one that's already been accepted or rejected returns 409, so a proposal can't be double-applied or re-decided.
 
-Nothing here is autonomous: analysis only runs when `/sage/analyze/{agent}` is called, and a proposal only changes live behavior once a human explicitly accepts it. The next step is a PWA panel to trigger analysis and review proposals without curling the API by hand.
+Nothing here is autonomous: analysis only runs when `/sage/analyze/{agent}` is called, and a proposal only changes live behavior once a human explicitly accepts it. The PWA panel (Settings → "Persona (SAGE)") drives all of this: an "Analyze feedback" button, a list of pending proposals with Accept/Reject, and "Reset persona to default" — the currently selected agent throughout, matching the chat view. Verified end to end with a real browser (Playwright): a seeded pending proposal renders correctly and shows its rationale/proposed prompt, accepting one actually writes the override (confirmed against the database, not just the UI), and rejecting one leaves the override untouched; the no-feedback-yet error path from `/sage/analyze` also surfaces correctly in the panel instead of failing silently.
 
 ### Run locally
 
@@ -123,4 +124,4 @@ To set it up:
 
 The original plan's phases are now all in place: cloud backend, remote inference, durable memory, personas, full agent swarm, the Android/web client, basic hardening (rate limiting, message-length caps), and a CI-backed test suite.
 
-KAIROS/SAGE — the self-improvement loops from the original blueprint — are underway, shipped as incremental steps: feedback capture, utility-weighted memory retrieval (KAIROS), override storage, and now SAGE's actual proposal generation (this PR) are done. Still to come: a PWA panel to trigger analysis and review/accept/reject proposals without curling the API by hand. Neither KAIROS nor SAGE is a scheduled background worker — Render's free tier doesn't support that without cost, and the service sleeps when idle anyway — so KAIROS is inline scoring computed at write/read time, and SAGE analysis only runs when explicitly triggered, never autonomously. Eventually, real per-user auth if this is ever used by more than one person, rather than a single shared API key.
+KAIROS/SAGE — the self-improvement loops from the original blueprint — are complete, shipped as five incremental steps: feedback capture, utility-weighted memory retrieval (KAIROS), override storage, proposal generation, and now the PWA panel (this PR) to trigger analysis and review/accept/reject proposals from the phone. Neither KAIROS nor SAGE is a scheduled background worker — Render's free tier doesn't support that without cost, and the service sleeps when idle anyway — so KAIROS is inline scoring computed at write/read time, and SAGE analysis only runs when explicitly triggered, never autonomously. Eventually, real per-user auth if this is ever used by more than one person, rather than a single shared API key.
