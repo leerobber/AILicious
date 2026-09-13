@@ -62,6 +62,18 @@ curl http://127.0.0.1:8000/memory/stats -H "X-API-Key: $APP_API_KEY"
 
 `APP_API_KEY` is optional locally (auth is skipped if unset) but should always be set in production.
 
+### Tests
+
+```bash
+cd backend
+pip install -r requirements-dev.txt
+pytest -v
+```
+
+Covers persona loading, memory (round-trips, per-agent/per-session isolation, the schema-migration guard), rate limiting, and the API layer end to end (auth, 404s, the length cap, the 429 path, and — the one that matters most — that one agent's conversation never leaks into another's outgoing request to Mistral, checked by inspecting the mocked request payload itself rather than just row counts). The Mistral call is mocked so tests run offline with no API key or network access needed; everything else exercises real code paths, including a real local `libsql` database per test.
+
+Runs automatically on every PR and push to `main` via `.github/workflows/ci.yml`.
+
 ### Persistent memory (Turso)
 
 Conversation history is read/written through the [`libsql`](https://pypi.org/project/libsql/) Python package, which is drop-in DB-API-2.0-compatible with SQLite:
@@ -82,4 +94,4 @@ To set it up:
 
 ### Next steps
 
-The original plan's phases are now all in place: cloud backend, remote inference, durable memory, personas, full agent swarm, the Android/web client, and basic hardening (rate limiting, message-length caps). What's left is the KAIROS/SAGE self-improvement loops from the original blueprint — a design task before it's a coding task — and eventually real per-user auth if this is ever used by more than one person, rather than a single shared API key.
+The original plan's phases are now all in place: cloud backend, remote inference, durable memory, personas, full agent swarm, the Android/web client, basic hardening (rate limiting, message-length caps), and a CI-backed test suite. What's left is the KAIROS/SAGE self-improvement loops from the original blueprint — a design task before it's a coding task — and eventually real per-user auth if this is ever used by more than one person, rather than a single shared API key.

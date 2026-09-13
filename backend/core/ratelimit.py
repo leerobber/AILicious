@@ -22,3 +22,9 @@ def check_rate_limit(key: str, max_requests: int) -> tuple[bool, float]:
 
         window.append(now)
         return True, 0.0
+
+
+def reset() -> None:
+    """Clear all rate-limit state. For test isolation only."""
+    with _lock:
+        _requests.clear()
