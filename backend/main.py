@@ -2,9 +2,11 @@ import asyncio
 import os
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from core.memory import add_message, get_history, get_stats, init_db
@@ -15,6 +17,7 @@ MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 MISTRAL_MODEL = os.environ.get("MISTRAL_MODEL", "mistral-small-latest")
 APP_API_KEY = os.environ.get("APP_API_KEY")
 HISTORY_LIMIT = 20
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 @asynccontextmanager
@@ -105,3 +108,7 @@ async def chat_with_agent(name: str, req: ChatRequest, x_api_key: str | None = H
     if not has_persona(name):
         raise HTTPException(status_code=404, detail=f"Unknown agent '{name}'. Available: {list_personas()}")
     return await run_agent_chat(name, req.message, req.session_id)
+
+
+# Mounted last so it only catches paths not already matched by an API route above.
+app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
