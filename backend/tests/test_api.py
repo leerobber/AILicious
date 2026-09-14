@@ -768,6 +768,91 @@ def test_unknown_tool_call_name_reports_failure_without_being_treated_as_delegat
     assert tool_result_message["content"] == "Tool call failed: unknown tool 'totally_made_up_tool'."
 
 
+def test_looks_time_sensitive_matches_common_phrasings():
+    from main import _looks_time_sensitive
+
+    assert _looks_time_sensitive("give me today's news") is True
+    assert _looks_time_sensitive("what's the weather like right now") is True
+    assert _looks_time_sensitive("who won the election") is True
+    assert _looks_time_sensitive("write me a python function to reverse a list") is False
+    assert _looks_time_sensitive("hello") is False
+
+
+def test_nexus_forces_search_tool_choice_for_time_sensitive_message(client, monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "TAVILY_API_KEY", "fake-tavily-key")
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "give me today's news"})
+    assert resp.status_code == 200
+    assert sent_requests[-1]["tool_choice"] == {"type": "function", "function": {"name": "search_web"}}
+
+
+def test_nexus_does_not_force_tool_choice_for_non_time_sensitive_message(client, monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "TAVILY_API_KEY", "fake-tavily-key")
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hello"})
+    assert resp.status_code == 200
+    assert sent_requests[-1]["tool_choice"] == "auto"
+
+
+def test_nexus_does_not_force_tool_choice_without_tavily_key(client):
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "give me today's news"})
+    assert resp.status_code == 200
+    assert sent_requests[-1]["tool_choice"] == "auto"
+
+
+def test_nexus_second_round_tool_choice_reverts_to_auto_after_forced_search(client, monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "TAVILY_API_KEY", "fake-tavily-key")
+
+    tool_call_args = json.dumps({"query": "today's news"})
+    call_log: list[dict] = []
+
+    async def sequenced_post(self, url, json=None, headers=None, **kwargs):
+        call_log.append(json)
+        if "tavily.com" in str(url):
+            return httpx.Response(200, json={"results": []}, request=httpx.Request("POST", url))
+        if len([c for c in call_log if "model" in c]) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "search_web", "arguments": tool_call_args},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "no news found"}}]}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", sequenced_post)
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "give me today's news"})
+    assert resp.status_code == 200
+
+    mistral_calls = [c for c in call_log if "model" in c]
+    assert len(mistral_calls) == 2
+    assert mistral_calls[0]["tool_choice"] == {"type": "function", "function": {"name": "search_web"}}
+    assert mistral_calls[1]["tool_choice"] == "auto"
+
+
 def test_cross_agent_memory_does_not_leak(client):
     forge_resp = client.post("/agents/forge", headers={"X-API-Key": VALID_KEY}, json={"message": "forge secret"})
     session_id = forge_resp.json()["session_id"]
