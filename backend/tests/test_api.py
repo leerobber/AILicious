@@ -599,6 +599,175 @@ def test_nexus_delegation_loop_is_capped(client, monkeypatch):
     assert len(call_log) == 5
 
 
+def test_search_tool_omitted_when_tavily_not_configured(client):
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+    assert resp.status_code == 200
+    tool_names = {t["function"]["name"] for t in sent_requests[-1]["tools"]}
+    assert "search_web" not in tool_names
+
+
+def test_search_tool_included_when_tavily_configured(client, monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "TAVILY_API_KEY", "fake-tavily-key")
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+    assert resp.status_code == 200
+    tool_names = {t["function"]["name"] for t in sent_requests[-1]["tools"]}
+    assert "search_web" in tool_names
+
+
+def test_nexus_executes_real_web_search_and_records_query(client, monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "TAVILY_API_KEY", "fake-tavily-key")
+
+    tool_call_args = json.dumps({"query": "current weather in Paris"})
+    call_log: list[dict] = []
+
+    async def sequenced_post(self, url, json=None, headers=None, **kwargs):
+        call_log.append({"url": str(url), "json": json})
+        if "tavily.com" in str(url):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"title": "Paris Weather", "content": "Sunny, 22C", "url": "https://example.com/weather"}
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        if len(call_log) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "search_web", "arguments": tool_call_args},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "It's sunny in Paris, 22C."}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", sequenced_post)
+
+    resp = client.post(
+        "/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "what's the weather in Paris?"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["searched_web"] == ["current weather in Paris"]
+    assert body["response"] == "It's sunny in Paris, 22C."
+    # NEXUS-decides (mistral) + tavily search + NEXUS-synthesizes (mistral) = 3 calls total.
+    assert len(call_log) == 3
+
+
+def test_web_search_malformed_arguments_does_not_delegate_or_search(client, monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "TAVILY_API_KEY", "fake-tavily-key")
+
+    call_log: list[dict] = []
+
+    async def sequenced_post(self, url, json=None, headers=None, **kwargs):
+        call_log.append(json)
+        if len(call_log) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "search_web", "arguments": "not json"},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", sequenced_post)
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+    assert resp.status_code == 200
+    assert resp.json()["searched_web"] == []
+    assert resp.json()["delegated_to"] == []
+
+
+def test_unknown_tool_call_name_reports_failure_without_being_treated_as_delegation(client, monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "TAVILY_API_KEY", "fake-tavily-key")
+
+    call_log: list[dict] = []
+
+    async def sequenced_post(self, url, json=None, headers=None, **kwargs):
+        call_log.append(json)
+        if len(call_log) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "totally_made_up_tool", "arguments": "{}"},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", sequenced_post)
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+    assert resp.status_code == 200
+    assert resp.json()["delegated_to"] == []
+    assert resp.json()["searched_web"] == []
+
+    # Isolates the explicit unknown-tool-name branch, not just "the turn didn't crash": a name
+    # matching neither known tool must produce this exact message, not silently fall through to
+    # being interpreted as a (malformed) delegation call, which would also leave delegated_to
+    # empty and could look like this test passed for the wrong reason.
+    tool_result_message = call_log[1]["messages"][-1]
+    assert tool_result_message["role"] == "tool"
+    assert tool_result_message["content"] == "Tool call failed: unknown tool 'totally_made_up_tool'."
+
+
 def test_cross_agent_memory_does_not_leak(client):
     forge_resp = client.post("/agents/forge", headers={"X-API-Key": VALID_KEY}, json={"message": "forge secret"})
     session_id = forge_resp.json()["session_id"]
