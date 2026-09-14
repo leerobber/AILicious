@@ -38,12 +38,14 @@ def client(tmp_path, monkeypatch):
     from core import memory as memory_module
     from core import persona_overrides as persona_overrides_module
     from core import sage_proposals as sage_proposals_module
+    from core import user_profile as user_profile_module
 
     db_path = tmp_path / "api_test.db"
     monkeypatch.setattr(memory_module, "DB_PATH", db_path)
     monkeypatch.setattr(persona_overrides_module, "DB_PATH", db_path)
     monkeypatch.setattr(sage_proposals_module, "DB_PATH", db_path)
     monkeypatch.setattr(digest_module, "DB_PATH", db_path)
+    monkeypatch.setattr(user_profile_module, "DB_PATH", db_path)
     digest_module._active_agents.clear()
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
     sent_requests.clear()
@@ -421,6 +423,97 @@ def test_chat_schedules_digest_once_threshold_crossed(client, monkeypatch):
 
     client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "two"})
     assert scheduled_digest_agents == ["nexus"]
+
+
+def test_profile_requires_api_key(client):
+    resp = client.get("/profile")
+    assert resp.status_code == 401
+
+
+def test_profile_defaults_empty_when_none_applied(client):
+    resp = client.get("/profile", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 200
+    assert resp.json() == {"profile": "", "updated_at": None}
+
+
+def test_profile_returns_applied_value(client):
+    from core import user_profile as user_profile_module
+
+    user_profile_module.apply_profile("Name: Lee. Works on AILicious.")
+
+    resp = client.get("/profile", headers={"X-API-Key": VALID_KEY})
+    body = resp.json()
+    assert body["profile"] == "Name: Lee. Works on AILicious."
+    assert body["updated_at"] is not None
+
+
+def test_chat_includes_profile_in_outgoing_system_prompt_when_present(client):
+    from core import user_profile as user_profile_module
+
+    user_profile_module.apply_profile("Name: Lee. Prefers concise answers.")
+
+    client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+
+    system_contents = [m["content"] for m in sent_requests[-1]["messages"] if m["role"] == "system"]
+    assert any("Name: Lee. Prefers concise answers." in c for c in system_contents)
+
+
+def test_chat_omits_profile_system_message_when_none_applied(client):
+    client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+
+    system_contents = [m["content"] for m in sent_requests[-1]["messages"] if m["role"] == "system"]
+    assert not any("across all AILicious agents" in c for c in system_contents)
+
+
+def test_profile_is_shared_across_different_agents(client):
+    from core import user_profile as user_profile_module
+
+    user_profile_module.apply_profile("Name: Lee.")
+
+    client.post("/agents/forge", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+
+    system_contents = [m["content"] for m in sent_requests[-1]["messages"] if m["role"] == "system"]
+    assert any("Name: Lee." in c for c in system_contents)
+
+
+def test_digest_cycle_merges_into_shared_profile(monkeypatch, tmp_path):
+    """The digest -> profile chaining lives in main._run_digest_safely, which is
+    stubbed out by the client fixture (see scheduled_digest_agents above) to keep
+    HTTP tests deterministic -- so this calls the real function directly instead,
+    the same way test_digest.py exercises run_digest_cycle directly."""
+    import asyncio
+
+    from core import digest as digest_module
+    from core import memory as memory_module
+    from core import user_profile as user_profile_module
+    import main as main_module
+
+    db_path = tmp_path / "digest_profile_test.db"
+    monkeypatch.setattr(digest_module, "DB_PATH", db_path)
+    monkeypatch.setattr(memory_module, "DB_PATH", db_path)
+    monkeypatch.setattr(user_profile_module, "DB_PATH", db_path)
+    digest_module.init_db()
+    memory_module.init_db()
+    user_profile_module.init_db()
+    digest_module._active_agents.clear()
+
+    memory_module.add_message("s1", "nexus", "user", "My name is Lee.")
+
+    replies = iter(
+        [
+            json.dumps({"digest": "User's name is Lee.", "topic_shift": False, "signal_quality": ""}),
+            json.dumps({"profile": "Name: Lee."}),
+        ]
+    )
+
+    async def fake_call_mistral(messages):
+        return next(replies)
+
+    monkeypatch.setattr(main_module, "_call_mistral", fake_call_mistral)
+
+    asyncio.run(main_module._run_digest_safely("nexus"))
+
+    assert user_profile_module.get_profile() == "Name: Lee."
 
 
 def test_nexus_chat_without_tool_call_behaves_normally(client):
