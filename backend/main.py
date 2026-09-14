@@ -86,14 +86,14 @@ def enforce_rate_limit(identifier: str) -> None:
         )
 
 
-async def _call_mistral_raw(messages: list[dict], tools: list[dict] | None = None) -> dict:
+async def _call_mistral_raw(messages: list[dict], tools: list[dict] | None = None, tool_choice: str | dict = "auto") -> dict:
     if not MISTRAL_API_KEY:
         raise HTTPException(status_code=500, detail="MISTRAL_API_KEY is not configured on the server")
 
     payload = {"model": MISTRAL_MODEL, "messages": messages}
     if tools:
         payload["tools"] = tools
-        payload["tool_choice"] = "auto"
+        payload["tool_choice"] = tool_choice
     headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}"}
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -243,13 +243,37 @@ def _nexus_tools() -> list[dict]:
     return tools
 
 
+# tool_choice: "auto" leaves the call decision entirely to the model -- live-tested twice and
+# found unreliable both ways: it can silently skip a working search tool and answer from its own
+# (possibly stale or invented) knowledge, formatted convincingly enough to look grounded even
+# when it isn't. A directive system prompt (see nexus.yaml) cut this down but didn't eliminate
+# it, so for messages that look time-sensitive, the first round forces the actual search_web
+# call instead of relying on the model choosing to make it.
+_TIME_SENSITIVE_KEYWORDS = (
+    "today", "tonight", "this morning", "this week", "right now", "currently", "latest",
+    "breaking", "recent", "recently", "up to date", "up-to-date", "news", "headline",
+    "score", "weather", "forecast", "stock price", "exchange rate", "what happened",
+    "what's happening", "whats happening", "who won", "current price", "current weather",
+)
+
+
+def _looks_time_sensitive(message: str) -> bool:
+    lowered = message.lower()
+    return any(keyword in lowered for keyword in _TIME_SENSITIVE_KEYWORDS)
+
+
 async def _run_nexus_turn(messages: list[dict], session_id: str) -> tuple[str, list[str], list[str]]:
     conversation = list(messages)
     delegated_to: list[str] = []
     searched_web: list[str] = []
 
-    for _ in range(MAX_TOOL_ROUNDS_PER_TURN):
-        data = await _call_mistral_raw(conversation, tools=_nexus_tools())
+    force_search = bool(TAVILY_API_KEY) and messages and _looks_time_sensitive(messages[-1]["content"])
+
+    for round_num in range(MAX_TOOL_ROUNDS_PER_TURN):
+        tool_choice = (
+            {"type": "function", "function": {"name": "search_web"}} if force_search and round_num == 0 else "auto"
+        )
+        data = await _call_mistral_raw(conversation, tools=_nexus_tools(), tool_choice=tool_choice)
         choice_message = data["choices"][0]["message"]
         tool_calls = choice_message.get("tool_calls")
 
