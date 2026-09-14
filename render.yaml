@@ -21,3 +21,5 @@ services:
         sync: false
       - key: TURSO_AUTH_TOKEN
         sync: false
+      - key: TAVILY_API_KEY
+        sync: false

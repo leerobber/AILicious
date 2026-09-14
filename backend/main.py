@@ -25,6 +25,8 @@ MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 MISTRAL_MODEL = os.environ.get("MISTRAL_MODEL", "mistral-small-latest")
 APP_API_KEY = os.environ.get("APP_API_KEY")
+TAVILY_API_URL = "https://api.tavily.com/search"
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")  # optional: web search tool is omitted if unset
 RECENT_TAIL_LIMIT = 6  # short raw window; the conversation digest carries the rest
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "20"))
 MAX_MESSAGE_LENGTH = int(os.environ.get("MAX_MESSAGE_LENGTH", "4000"))
@@ -57,6 +59,7 @@ class ChatResponse(BaseModel):
     agent: str
     message_id: int
     delegated_to: list[str] = []
+    searched_web: list[str] = []
 
 
 class FeedbackRequest(BaseModel):
@@ -115,8 +118,10 @@ async def _call_mistral(messages: list[dict]) -> str:
 # Real agent-to-agent delegation: NEXUS gets a tool letting it hand a task to one of the
 # specialized agents and get their actual response back, rather than just telling the user
 # which agent to switch to. Only NEXUS carries this tool -- the specialists themselves don't
-# delegate further, which structurally rules out delegation loops between agents.
-MAX_DELEGATIONS_PER_TURN = 2  # forces a plain final answer if the model won't stop delegating
+# delegate further, which structurally rules out delegation loops between agents. NEXUS may
+# also get a web search tool (below) when TAVILY_API_KEY is configured -- same NEXUS-only
+# pattern, same round cap.
+MAX_TOOL_ROUNDS_PER_TURN = 2  # forces a plain final answer if the model won't stop calling tools
 
 
 def _delegatable_agents() -> list[str]:
@@ -178,35 +183,104 @@ async def _execute_delegation(call: dict, session_id: str) -> tuple[str | None, 
     return agent, f"{agent.upper()} responded: {delegate_response.response}"
 
 
-async def _run_nexus_turn(messages: list[dict], session_id: str) -> tuple[str, list[str]]:
+def _web_search_tool_schema() -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": (
+                "Search the live web for current information. Use this when a question needs "
+                "up-to-date, real-time, or post-training-cutoff information you wouldn't "
+                "otherwise have."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query."},
+                },
+                "required": ["query"],
+            },
+        },
+    }
+
+
+async def _execute_web_search(call: dict) -> tuple[str | None, str]:
+    """Runs one search_web tool call for real via Tavily. Never raises: a search failure comes
+    back as a tool result NEXUS can react to (e.g. say search isn't working right now), not an
+    error that kills the whole turn.
+    """
+    try:
+        args = json.loads(call["function"]["arguments"])
+        query = args["query"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return None, f"Web search failed: malformed tool call ({exc})"
+
+    if not TAVILY_API_KEY:
+        return None, "Web search failed: no search provider is configured on the server."
+
+    payload = {"api_key": TAVILY_API_KEY, "query": query, "search_depth": "basic", "max_results": 5}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.post(TAVILY_API_URL, json=payload)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            return query, f"Web search failed: {exc.response.status_code} {exc.response.text}"
+        except httpx.RequestError as exc:
+            return query, f"Web search failed: {exc}"
+
+    results = resp.json().get("results", [])
+    if not results:
+        return query, "No results found."
+
+    lines = [f"- {r.get('title', '')}: {r.get('content', '')} ({r.get('url', '')})" for r in results[:5]]
+    return query, "\n".join(lines)
+
+
+def _nexus_tools() -> list[dict]:
+    tools = [_delegate_tool_schema()]
+    if TAVILY_API_KEY:
+        tools.append(_web_search_tool_schema())
+    return tools
+
+
+async def _run_nexus_turn(messages: list[dict], session_id: str) -> tuple[str, list[str], list[str]]:
     conversation = list(messages)
     delegated_to: list[str] = []
+    searched_web: list[str] = []
 
-    for _ in range(MAX_DELEGATIONS_PER_TURN):
-        data = await _call_mistral_raw(conversation, tools=[_delegate_tool_schema()])
+    for _ in range(MAX_TOOL_ROUNDS_PER_TURN):
+        data = await _call_mistral_raw(conversation, tools=_nexus_tools())
         choice_message = data["choices"][0]["message"]
         tool_calls = choice_message.get("tool_calls")
 
         if not tool_calls:
-            return choice_message.get("content") or "", delegated_to
+            return choice_message.get("content") or "", delegated_to, searched_web
 
         conversation.append(choice_message)
         for call in tool_calls:
-            agent_name, result_text = await _execute_delegation(call, session_id)
-            if agent_name:
-                delegated_to.append(agent_name)
+            name = call["function"]["name"]
+            if name == "delegate_to_agent":
+                agent_name, result_text = await _execute_delegation(call, session_id)
+                if agent_name:
+                    delegated_to.append(agent_name)
+            elif name == "search_web":
+                query, result_text = await _execute_web_search(call)
+                if query:
+                    searched_web.append(query)
+            else:
+                result_text = f"Tool call failed: unknown tool '{name}'."
             conversation.append(
                 {
                     "role": "tool",
                     "tool_call_id": call["id"],
-                    "name": call["function"]["name"],
+                    "name": name,
                     "content": result_text,
                 }
             )
 
-    # Ran out of delegation rounds -- force a plain final answer without further tool access.
+    # Ran out of tool-call rounds -- force a plain final answer without further tool access.
     final = await _call_mistral(conversation)
-    return final, delegated_to
+    return final, delegated_to, searched_web
 
 
 def _schedule_digest(agent: str) -> None:
@@ -244,9 +318,9 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
     messages += recent_tail + [{"role": "user", "content": message}]
 
     if agent == "nexus":
-        reply, delegated_to = await _run_nexus_turn(messages, session_id)
+        reply, delegated_to, searched_web = await _run_nexus_turn(messages, session_id)
     else:
-        reply, delegated_to = await _call_mistral(messages), []
+        reply, delegated_to, searched_web = await _call_mistral(messages), [], []
 
     await asyncio.to_thread(add_message, session_id, agent, "user", message)
     message_id = await asyncio.to_thread(add_message, session_id, agent, "assistant", reply)
@@ -260,7 +334,12 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
         _schedule_digest(agent)
 
     return ChatResponse(
-        response=reply, session_id=session_id, agent=agent, message_id=message_id, delegated_to=delegated_to
+        response=reply,
+        session_id=session_id,
+        agent=agent,
+        message_id=message_id,
+        delegated_to=delegated_to,
+        searched_web=searched_web,
     )
 
 
