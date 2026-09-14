@@ -22,10 +22,21 @@ self.addEventListener("activate", (event) => {
 // serving its first-ever cached index.html indefinitely, invisibly. The cache still
 // gets refreshed on every successful fetch, so this keeps the offline-capable PWA
 // benefit without the staleness trap.
+//
+// "Network-first" isn't automatically "network, for real": a plain fetch() still honors
+// the browser's own HTTP cache, and this server sends no Cache-Control header -- so a
+// browser applying heuristic freshness to a recent Last-Modified/ETag can satisfy this
+// fetch() straight from its local HTTP cache, with no request ever reaching the network,
+// on an ordinary reload. Found live: a real deploy landed, a real reload happened, and
+// the reloaded page still ran the pre-deploy JavaScript with zero server-side trace of
+// the reload ever asking for it. { cache: "no-store" } forces this fetch to actually hit
+// the network every time, bypassing the browser's HTTP cache entirely -- we already do
+// our own freshness-controlled caching via Cache Storage below, so the browser's HTTP
+// cache was never buying anything here except this exact staleness trap.
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
   event.respondWith(
-    fetch(event.request)
+    fetch(event.request, { cache: "no-store" })
       .then((response) => {
         const responseCopy = response.clone();
         caches.open(CACHE_NAME).then((cache) => cache.put(event.request, responseCopy));
