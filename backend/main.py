@@ -20,6 +20,9 @@ from core.persona_overrides import init_db as init_persona_overrides_db
 from core.ratelimit import check_rate_limit
 from core.sage_proposals import create_proposal, get_proposal, list_proposals, set_proposal_status
 from core.sage_proposals import init_db as init_sage_proposals_db
+from core.user_profile import get_profile_state, run_profile_merge
+from core.user_profile import get_profile as get_user_profile
+from core.user_profile import init_db as init_user_profile_db
 
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
@@ -41,6 +44,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(init_persona_overrides_db)
     await asyncio.to_thread(init_sage_proposals_db)
     await asyncio.to_thread(init_digest_db)
+    await asyncio.to_thread(init_user_profile_db)
     await asyncio.to_thread(load_personas)
     yield
 
@@ -330,7 +334,10 @@ def _schedule_digest(agent: str) -> None:
 
 
 async def _run_digest_safely(agent: str) -> None:
-    await run_digest_cycle(agent, _call_mistral)
+    digested = await run_digest_cycle(agent, _call_mistral)
+    if digested:
+        agent_digest = await asyncio.to_thread(get_digest_text, agent)
+        await run_profile_merge(agent, agent_digest, _call_mistral)
 
 
 async def run_agent_chat(agent: str, message: str, session_id: str | None) -> ChatResponse:
@@ -345,12 +352,17 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
 
     recent_tail = await asyncio.to_thread(get_history, session_id, agent, RECENT_TAIL_LIMIT)
     digest_text = await asyncio.to_thread(get_digest_text, agent)
+    profile_text = await asyncio.to_thread(get_user_profile)
     override = await asyncio.to_thread(get_override, agent)
     system_prompt = override if override is not None else get_system_prompt(agent)
 
     messages = [{"role": "system", "content": system_prompt}]
+    if profile_text:
+        messages.append(
+            {"role": "system", "content": f"What you know about this user across all AILicious agents:\n{profile_text}"}
+        )
     if digest_text:
-        messages.append({"role": "system", "content": f"What you know about this user so far:\n{digest_text}"})
+        messages.append({"role": "system", "content": f"What you specifically know from your own conversations with this user:\n{digest_text}"})
     messages += recent_tail + [{"role": "user", "content": message}]
 
     if agent == "nexus":
@@ -429,6 +441,12 @@ async def agents(x_api_key: str | None = Header(default=None)) -> dict:
 async def memory_stats(x_api_key: str | None = Header(default=None)) -> dict:
     require_api_key(x_api_key)
     return await asyncio.to_thread(get_stats)
+
+
+@app.get("/profile")
+async def profile(x_api_key: str | None = Header(default=None)) -> dict:
+    require_api_key(x_api_key)
+    return await asyncio.to_thread(get_profile_state)
 
 
 @app.post("/chat", response_model=ChatResponse)
