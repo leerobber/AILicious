@@ -191,7 +191,12 @@ def _web_search_tool_schema() -> dict:
             "description": (
                 "Search the live web for current information. Use this when a question needs "
                 "up-to-date, real-time, or post-training-cutoff information you wouldn't "
-                "otherwise have."
+                "otherwise have. Results come back as numbered [Source N] blocks, each with its "
+                "own URL, title, and content -- a block's content can cover several distinct "
+                "stories (e.g. a news homepage), not just one. When you cite something, cite the "
+                "exact URL of the block it actually came from. Never attribute a fact to a "
+                "different source's URL than the one its content actually appeared under, even "
+                "when several sources are about similar topics."
             ),
             "parameters": {
                 "type": "object",
@@ -232,8 +237,15 @@ async def _execute_web_search(call: dict) -> tuple[str | None, str]:
     if not results:
         return query, "No results found."
 
-    lines = [f"- {r.get('title', '')}: {r.get('content', '')} ({r.get('url', '')})" for r in results[:5]]
-    return query, "\n".join(lines)
+    # Each result's content can be a long scrape covering several distinct stories (a news
+    # outlet's homepage, not a single article) -- clearly delimited, numbered blocks make it
+    # much harder to blur together which fact came from which URL than one flat bulleted line
+    # per result did. See _web_search_tool_schema's description for the matching instruction.
+    blocks = [
+        f"[Source {i}] {r.get('url', '')}\n{r.get('title', '')}\n{r.get('content', '')}"
+        for i, r in enumerate(results[:5], start=1)
+    ]
+    return query, "\n\n---\n\n".join(blocks)
 
 
 def _nexus_tools() -> list[dict]:
