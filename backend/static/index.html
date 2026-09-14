@@ -220,6 +220,26 @@
   .fb-btn:disabled { cursor: default; }
   .fb-btn:disabled:not(.active) { opacity: 0.35; }
 
+  .meta-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding-left: 2px;
+  }
+  .meta-badge {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--text-dim);
+    background: var(--panel-2);
+    border-radius: 10px;
+    padding: 3px 8px 3px 6px;
+    line-height: 1.3;
+  }
+  .meta-badge svg { width: 11px; height: 11px; flex-shrink: 0; }
+  .meta-badge .meta-badge-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
+
   .msg.pending { color: var(--text-dim); }
   .pending-dots span {
     display: inline-block;
@@ -523,6 +543,37 @@
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path></svg>';
     const THUMB_DOWN_SVG =
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h3a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-3"></path></svg>';
+    const SEARCH_SVG =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>';
+    const DELEGATE_SVG =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 10 20 15 15 20"></polyline><path d="M4 4v7a4 4 0 0 0 4 4h12"></path></svg>';
+
+    // Ground-truth badges: what the backend actually did this turn (real delegation, real
+    // search), shown independent of whether the model's own prose happened to mention it --
+    // NEXUS deciding not to call a tool it had, or wording a delegation ambiguously, shouldn't
+    // be the only way this is visible.
+    function createMetaBadges(delegatedTo, searchedWeb) {
+      if (!delegatedTo?.length && !searchedWeb?.length) return null;
+
+      const row = document.createElement("div");
+      row.className = "meta-badges";
+
+      for (const agent of delegatedTo || []) {
+        const badge = document.createElement("span");
+        badge.className = "meta-badge";
+        badge.title = `Delegated to ${agent.toUpperCase()}`;
+        badge.innerHTML = `${DELEGATE_SVG}<span class="meta-badge-label">${agent.toUpperCase()}</span>`;
+        row.appendChild(badge);
+      }
+      for (const query of searchedWeb || []) {
+        const badge = document.createElement("span");
+        badge.className = "meta-badge";
+        badge.title = `Searched the web: ${query}`;
+        badge.innerHTML = `${SEARCH_SVG}<span class="meta-badge-label">${query}</span>`;
+        row.appendChild(badge);
+      }
+      return row;
+    }
 
     function updateHistoryFeedback(agent, messageId, rating) {
       const history = getHistory(agent);
@@ -601,6 +652,9 @@
         bubble.textContent = content;
         col.appendChild(bubble);
 
+        const badges = createMetaBadges(meta.delegatedTo, meta.searchedWeb);
+        if (badges) col.appendChild(badges);
+
         if (meta.messageId) {
           col.appendChild(createFeedbackRow(meta.messageId, meta.feedback ?? null));
         }
@@ -634,7 +688,12 @@
         return;
       }
       for (const turn of history) {
-        renderMessage(turn.role, turn.content, { messageId: turn.message_id, feedback: turn.feedback });
+        renderMessage(turn.role, turn.content, {
+          messageId: turn.message_id,
+          feedback: turn.feedback,
+          delegatedTo: turn.delegated_to,
+          searchedWeb: turn.searched_web,
+        });
       }
       scrollToBottom();
     }
@@ -904,6 +963,9 @@
         setSessionId(agent, data.session_id);
         pending.classList.remove("pending");
         pending.textContent = data.response;
+
+        const badges = createMetaBadges(data.delegated_to, data.searched_web);
+        if (badges) pending.parentElement.appendChild(badges);
         pending.parentElement.appendChild(createFeedbackRow(data.message_id, null));
 
         const updatedHistory = getHistory(agent);
@@ -912,6 +974,8 @@
           content: data.response,
           message_id: data.message_id,
           feedback: null,
+          delegated_to: data.delegated_to || [],
+          searched_web: data.searched_web || [],
         });
         setHistory(agent, updatedHistory);
       } catch (err) {
