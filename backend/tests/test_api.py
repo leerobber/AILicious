@@ -163,6 +163,39 @@ def test_memory_stats_reflects_chat_activity(client):
     assert resp.json()["total_messages"] == 2  # the user turn + the mocked assistant reply
 
 
+def test_sage_current_requires_api_key(client):
+    resp = client.get("/sage/current/nexus")
+    assert resp.status_code == 401
+
+
+def test_sage_current_unknown_agent_is_404(client):
+    resp = client.get("/sage/current/doesnotexist", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 404
+
+
+def test_sage_current_returns_yaml_default_when_no_override(client):
+    resp = client.get("/sage/current/nexus", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["agent"] == "nexus"
+    assert body["is_override"] is False
+    assert "NEXUS" in body["system_prompt"]
+
+
+def test_sage_current_returns_override_when_set(client):
+    client.post(
+        "/sage/override/nexus",
+        headers={"X-API-Key": VALID_KEY},
+        json={"system_prompt": "You are a pirate."},
+    )
+
+    resp = client.get("/sage/current/nexus", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["is_override"] is True
+    assert body["system_prompt"] == "You are a pirate."
+
+
 def test_sage_override_requires_api_key(client):
     resp = client.post("/sage/override/nexus", json={"system_prompt": "You are a pirate."})
     assert resp.status_code == 401

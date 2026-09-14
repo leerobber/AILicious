@@ -372,16 +372,21 @@
     padding: 12px;
   }
   .proposal-card .rationale { font-size: 13px; color: var(--text-dim); margin-bottom: 8px; }
-  .proposal-card .prompt-preview {
+  .proposal-card .prompt-preview,
+  .proposal-card .diff-view {
     font-size: 13px;
     white-space: pre-wrap;
     background: var(--bg-2);
     border-radius: 8px;
     padding: 8px 10px;
     margin-bottom: 10px;
-    max-height: 140px;
+    max-height: 200px;
     overflow-y: auto;
+    line-height: 1.5;
   }
+  .diff-added { background: rgba(74, 222, 128, 0.25); border-radius: 3px; }
+  .diff-removed { background: rgba(251, 113, 133, 0.25); color: var(--text-dim); text-decoration: line-through; border-radius: 3px; }
+  .diff-note { font-size: 11px; color: var(--text-dim); margin: -4px 0 8px; }
   .proposal-card button.accept { background: var(--success); color: #04250f; font-weight: 600; }
   .proposal-card button.accept:hover { filter: brightness(1.08); }
   .proposal-card button.reject { background: transparent; color: var(--error); border: 1px solid var(--error); }
@@ -773,7 +778,68 @@
       sageProposalsEl.innerHTML = `<div class="no-proposals">${text}</div>`;
     }
 
-    function renderProposalCard(proposal) {
+    // Word-level diff (LCS-based) between the agent's current system prompt and a proposal's
+    // proposed one -- so accepting is an informed "here's exactly what changes" decision
+    // instead of re-reading the whole prompt from scratch and trying to spot the difference.
+    function tokenizeForDiff(text) {
+      return text.match(/\S+|\s+/g) || [];
+    }
+
+    function computeWordDiff(oldText, newText) {
+      const a = tokenizeForDiff(oldText);
+      const b = tokenizeForDiff(newText);
+      const n = a.length;
+      const m = b.length;
+      const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+      for (let i = n - 1; i >= 0; i--) {
+        for (let j = m - 1; j >= 0; j--) {
+          dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+        }
+      }
+      const ops = [];
+      let i = 0;
+      let j = 0;
+      while (i < n && j < m) {
+        if (a[i] === b[j]) {
+          ops.push({ type: "same", text: a[i] });
+          i++;
+          j++;
+        } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+          ops.push({ type: "removed", text: a[i] });
+          i++;
+        } else {
+          ops.push({ type: "added", text: b[j] });
+          j++;
+        }
+      }
+      while (i < n) {
+        ops.push({ type: "removed", text: a[i] });
+        i++;
+      }
+      while (j < m) {
+        ops.push({ type: "added", text: b[j] });
+        j++;
+      }
+      return ops;
+    }
+
+    function renderDiffView(oldText, newText) {
+      const view = document.createElement("div");
+      view.className = "diff-view";
+      for (const op of computeWordDiff(oldText, newText)) {
+        if (op.type === "same") {
+          view.appendChild(document.createTextNode(op.text));
+          continue;
+        }
+        const span = document.createElement("span");
+        span.className = op.type === "added" ? "diff-added" : "diff-removed";
+        span.textContent = op.text;
+        view.appendChild(span);
+      }
+      return view;
+    }
+
+    function renderProposalCard(proposal, currentSystemPrompt) {
       const card = document.createElement("div");
       card.className = "proposal-card";
 
@@ -782,10 +848,18 @@
       rationale.textContent = proposal.rationale;
       card.appendChild(rationale);
 
-      const preview = document.createElement("div");
-      preview.className = "prompt-preview";
-      preview.textContent = proposal.proposed_system_prompt;
-      card.appendChild(preview);
+      if (typeof currentSystemPrompt === "string") {
+        const note = document.createElement("div");
+        note.className = "diff-note";
+        note.textContent = "Highlighted: removed (struck through) vs. added, against the current persona.";
+        card.appendChild(note);
+        card.appendChild(renderDiffView(currentSystemPrompt, proposal.proposed_system_prompt));
+      } else {
+        const preview = document.createElement("div");
+        preview.className = "prompt-preview";
+        preview.textContent = proposal.proposed_system_prompt;
+        card.appendChild(preview);
+      }
 
       const row = document.createElement("div");
       row.className = "row";
@@ -826,6 +900,15 @@
       return card;
     }
 
+    async function fetchCurrentSystemPrompt(agent) {
+      const resp = await fetch(`${API_BASE}/sage/current/${agent}`, {
+        headers: { "X-API-Key": getApiKey() },
+      });
+      if (!resp.ok) throw new Error(`request failed (${resp.status})`);
+      const data = await resp.json();
+      return data.system_prompt;
+    }
+
     async function loadProposals() {
       const agent = currentAgent();
       sageProposalsEl.innerHTML = '<div class="no-proposals">Loading…</div>';
@@ -840,8 +923,16 @@
           renderNoProposals();
           return;
         }
+        // Best-effort: a diff needs the current prompt, but a proposal is still reviewable
+        // without one -- renderProposalCard falls back to a plain preview if this is undefined.
+        let currentSystemPrompt;
+        try {
+          currentSystemPrompt = await fetchCurrentSystemPrompt(agent);
+        } catch {
+          currentSystemPrompt = undefined;
+        }
         for (const proposal of data.proposals) {
-          sageProposalsEl.appendChild(renderProposalCard(proposal));
+          sageProposalsEl.appendChild(renderProposalCard(proposal, currentSystemPrompt));
         }
       } catch (err) {
         renderNoProposals(`Couldn't load proposals: ${err.message}`);

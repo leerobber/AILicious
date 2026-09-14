@@ -461,6 +461,16 @@ async def feedback(req: FeedbackRequest, request: Request, x_api_key: str | None
     return {"status": "ok"}
 
 
+@app.get("/sage/current/{agent}")
+async def sage_current(agent: str, x_api_key: str | None = Header(default=None)) -> dict:
+    require_api_key(x_api_key)
+    if not has_persona(agent):
+        raise HTTPException(status_code=404, detail=f"Unknown agent '{agent}'. Available: {list_personas()}")
+    override = await asyncio.to_thread(get_override, agent)
+    system_prompt = override if override is not None else get_system_prompt(agent)
+    return {"agent": agent, "system_prompt": system_prompt, "is_override": override is not None}
+
+
 @app.post("/sage/override/{agent}")
 async def sage_override(
     agent: str, req: PersonaOverrideRequest, x_api_key: str | None = Header(default=None)
