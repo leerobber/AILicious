@@ -678,6 +678,81 @@ def test_nexus_executes_real_web_search_and_records_query(client, monkeypatch):
     assert len(call_log) == 3
 
 
+def test_web_search_formats_multiple_results_as_distinct_attributable_sources(client, monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "TAVILY_API_KEY", "fake-tavily-key")
+
+    tool_call_args = json.dumps({"query": "today's military news"})
+    call_log: list[dict] = []
+
+    async def sequenced_post(self, url, json=None, headers=None, **kwargs):
+        call_log.append({"url": str(url), "json": json})
+        if "tavily.com" in str(url):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "title": "Task & Purpose",
+                            "content": "Iran blew the hell out of a base in Bahrain.",
+                            "url": "https://taskandpurpose.com",
+                        },
+                        {
+                            "title": "Military Daily News",
+                            "content": "Trump pardons a Navy veteran.",
+                            "url": "https://www.military.com/daily-news",
+                        },
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        if len(call_log) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "search_web", "arguments": tool_call_args},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "summary"}}]}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", sequenced_post)
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "give me today's military news"})
+    assert resp.status_code == 200
+
+    # The tool-result message fed back into the third (synthesis) call must keep each source's
+    # url paired with its own content, not merged into one blob a model could mis-attribute --
+    # this is what actually went wrong live (a real headline got cited to the wrong domain).
+    tool_result = call_log[2]["json"]["messages"][-1]
+    assert tool_result["role"] == "tool"
+    content = tool_result["content"]
+    assert "[Source 1] https://taskandpurpose.com" in content
+    assert "Iran blew the hell out of a base in Bahrain." in content
+    assert "[Source 2] https://www.military.com/daily-news" in content
+    assert "Trump pardons a Navy veteran." in content
+    # The Bahrain fact must appear before Source 2's block starts, i.e. within Source 1's own
+    # block -- not just present somewhere in the string, which a bad merge could still satisfy.
+    assert content.index("Iran blew the hell out of a base in Bahrain.") < content.index("[Source 2]")
+
+
 def test_web_search_malformed_arguments_does_not_delegate_or_search(client, monkeypatch):
     import main as main_module
 
