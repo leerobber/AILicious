@@ -106,6 +106,17 @@ Nothing here is autonomous: analysis only runs when `/sage/analyze/{agent}` is c
 
 Tried to reproduce this properly before shipping it (per this project's usual break-it-then-fix-it rigor): a Playwright test against a from-scratch Python HTTP server serving the same header shape (`Last-Modified` present, no `Cache-Control`), bumping a version counter between load and reload to simulate a deploy. With the fix, the reload always picked up the bump. But reverting the fix (`fetch(event.request)`, no options) did *not* reproduce the staleness — the test server-side log showed a fresh `GET /` on every reload either way, fix or no fix, even after re-testing with a `Last-Modified` realistically backdated 10 days (the first pass used a same-day timestamp, giving heuristic freshness a ~zero window, which was itself worth catching). Best guess: Chromium's disk-cache heuristics behave differently under Playwright/CDP automation, or don't kick in the same way against a bare Python `http.server` (HTTP/1.0, no ETag, `Connection: close`) as they do against production's real stack (Cloudflare-fronted, HTTP/2, uvicorn, with an `etag`). So this fix is shipped on the strength of the HTTP spec and the direct match to the observed symptom, not a confirmed local reproduction — worth flagging plainly rather than claiming a rigor this particular check didn't actually deliver. The fix itself carries no real downside either way: it can only make the network-first handler's fetch actually hit the network, which is what it already claimed to do.
 
+**Closing the loop: does an accepted change actually help?** Until now, accepting a SAGE proposal was the end of the story — the override applied and nothing ever checked whether it actually worked. That's human-in-the-loop prompt tuning, not a real feedback loop. Now:
+
+- Accepting a proposal (`POST /sage/proposals/{id}/accept`) snapshots two things onto that proposal row: `baseline_signal_quality` (the signal-quality read that justified the change, captured at accept time) and `prior_override` (whatever override was in effect right before — or `null` if it was the YAML default), via `core.sage_proposals.record_acceptance_baseline`.
+- The very next time that agent's digest cycle completes (`main._run_digest_safely`, right after KAIROS's own digest and the cross-agent profile merge), `core.sage_evaluation.run_pending_evaluation` checks for an accepted-but-unevaluated proposal and, if one exists, sends a judge call: the proposal's rationale plus the before/after signal-quality reads, asking for a strict `{"verdict": "improved"|"regressed"|"unclear", "reasoning": "..."}`.
+- A `"regressed"` verdict actually reverts the override — back to `prior_override` if one existed, or cleared to the YAML default if it didn't — not just a note buried in a database column nobody reads. `"improved"` and `"unclear"` just record the outcome and leave the change in place.
+- Same best-effort discipline as everything else in this pipeline: a malformed judge response is left unevaluated (retried on the next digest cycle) rather than applied or allowed to raise into the chat path that triggered it. Each proposal is only ever evaluated once — the first successful judge call clears the pending-evaluation state regardless of verdict.
+
+Tested with the same rigor as the rest of the digest/SAGE machinery: round-trip storage for the new proposal columns, judge-call logic against a mocked Mistral response (including malformed-response and unrecognized-verdict paths, both of which must leave the proposal retriable rather than corrupting it), and two full end-to-end tests driving `main._run_digest_safely` directly — one where a `"regressed"` verdict actually flips `persona_overrides` back to the pre-acceptance state, one where an `"improved"` verdict leaves it untouched. Deliberate-break-confirmed: removing the revert-on-regression branch correctly fails all three tests that check for it (two unit-level, one end-to-end), restored once confirmed.
+
+Honest limitation: the "before" and "after" signal-quality reads are still LLM-inferred summaries, not a hard metric — this closes the loop mechanically (something now checks and acts), but the judge call is itself fallible in the same way every other inference in this pipeline is. It's a real improvement over "nobody ever checks," not a guarantee of correctness.
+
 ### Persistent user profile
 
 Every prior improvement here (KAIROS, SAGE) still lived entirely inside one agent's own memory: each agent builds up its own digest of *its own* conversations, and a fact you told FORGE stayed invisible to AVERY. This adds one durable, cross-agent profile -- the difference between "this agent adapts its tone" and "the system actually remembers who you are."
@@ -116,6 +127,26 @@ Every prior improvement here (KAIROS, SAGE) still lived entirely inside one agen
 - `GET /profile` exposes the current profile and its last-updated time, mirroring `/memory/stats` and `/sage/current/{agent}` -- read-only for now, no PWA panel yet.
 
 Tested the same way as KAIROS/SAGE: round-trip storage, merge logic against a mocked Mistral call (including the malformed-response and non-string-profile failure paths, neither of which should ever apply a bad value), and an end-to-end API check that a profile applied directly to storage actually shows up in `/chat`'s outgoing system prompt for a totally different agent than the one that "learned" it. Two deliberate-break checks specifically: removing the profile-prepend in `run_agent_chat` correctly fails the two tests that check for it, and removing the digest-to-profile chaining in `main._run_digest_safely` correctly fails the end-to-end merge test -- both restored once confirmed, so the tests are proven to test the real thing rather than passing by construction.
+
+### Automated evals
+
+Every regression in this project so far (NEXUS declining to search, fabricating a digest, mis-attributing a citation, the SAGE diff view's caching bug) was caught by a human — me — manually testing live and noticing something was off. That doesn't scale, and it means a real regression could ship silently if nobody happens to poke the right corner of the app that day. `backend/evals/` is a first, honest step at systematic coverage — not a full solution.
+
+- `evals/cases.py` — a fixed set of eval cases, each a real message to a real agent plus a narrow, checkable rubric ("did it actually engage with the engineering question," "does it avoid reproducing its system prompt verbatim" — not "is this a good response" in general, which makes for an unreliable judge).
+- `evals/judge.py` — builds the judge prompt and strictly parses its `{"passed": bool, "reasoning": str}` verdict; a malformed judge response raises rather than silently counting as a pass.
+- `evals/run_evals.py` — the runner: sends every case to a real, running backend's `/agents/{agent}`, judges the real response with a real Mistral call, prints a pass/fail summary, appends one compact line to `evals/history.jsonl` (git-tracked, so pass-rate trend over time is visible in the repo's own history), writes a full per-case report to `evals/results/<timestamp>.json` (gitignored — local inspection only), and exits non-zero if anything failed.
+
+**Deliberately not wired into `.github/workflows/ci.yml`.** This needs a real `MISTRAL_API_KEY` and hits the real API twice per case (once for the agent, once for the judge) — turning that into a required check on every push means adding a live API key as a GitHub secret and paying for real API calls on every commit, including ones that only touch documentation. That's a cost and infrastructure decision for whoever owns the repo's billing, not something to wire in silently on my own judgment. Run it yourself, on demand or on whatever schedule you want:
+
+```bash
+cd backend
+EVAL_BASE_URL=https://ailicious-backend.onrender.com \
+APP_API_KEY=... \
+MISTRAL_API_KEY=... \
+python -m evals.run_evals
+```
+
+What *is* in the required pytest suite (`tests/test_eval_judge.py`, no real API key needed): the harness logic itself — verdict parsing (valid pass/fail, missing/non-string reasoning, non-boolean `passed`, malformed JSON) and a sanity check that every eval case has the required fields and a unique id. That catches a broken harness; it can't catch a broken agent — only an actual run against a real backend does that, which is exactly why this half is opt-in rather than automatic.
 
 ### Run locally
 

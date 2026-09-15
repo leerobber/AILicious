@@ -6,7 +6,10 @@ from core.db import get_connection as _db_get_connection
 
 _lock = threading.Lock()
 
-_COLUMNS = "id, agent, rationale, proposed_system_prompt, status, created_at, reviewed_at"
+_COLUMNS = (
+    "id, agent, rationale, proposed_system_prompt, status, created_at, reviewed_at, "
+    "baseline_signal_quality, prior_override, outcome, outcome_reasoning, evaluated_at"
+)
 
 
 def _get_connection():
@@ -22,6 +25,11 @@ def _row_to_dict(row) -> dict:
         "status": row[4],
         "created_at": row[5],
         "reviewed_at": row[6],
+        "baseline_signal_quality": row[7],
+        "prior_override": row[8],
+        "outcome": row[9],
+        "outcome_reasoning": row[10],
+        "evaluated_at": row[11],
     }
 
 
@@ -42,6 +50,21 @@ def init_db() -> None:
                 )
                 """
             )
+            # Closing the SAGE loop: an accepted proposal used to just apply and be
+            # forgotten, with nothing checking whether it actually helped. baseline_signal_quality
+            # and prior_override snapshot state at accept time; outcome/outcome_reasoning/
+            # evaluated_at record what a later judge call decided once fresh signal exists.
+            for column, ddl in (
+                ("baseline_signal_quality", "ALTER TABLE sage_proposals ADD COLUMN baseline_signal_quality TEXT"),
+                ("prior_override", "ALTER TABLE sage_proposals ADD COLUMN prior_override TEXT"),
+                ("outcome", "ALTER TABLE sage_proposals ADD COLUMN outcome TEXT NOT NULL DEFAULT ''"),
+                ("outcome_reasoning", "ALTER TABLE sage_proposals ADD COLUMN outcome_reasoning TEXT"),
+                ("evaluated_at", "ALTER TABLE sage_proposals ADD COLUMN evaluated_at TEXT"),
+            ):
+                try:
+                    conn.execute(ddl)
+                except ValueError:
+                    pass  # column already exists (fresh table, or already migrated)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sage_proposals_agent ON sage_proposals(agent)")
             conn.commit()
         finally:
@@ -115,3 +138,51 @@ def set_proposal_status(proposal_id: int, status: str) -> bool:
         finally:
             conn.close()
     return True
+
+
+def record_acceptance_baseline(proposal_id: int, baseline_signal_quality: str, prior_override: str | None) -> None:
+    """Snapshots state at the moment a proposal is accepted -- what 'signal_quality' read
+    justified the change, and what override (if any) was in effect right before it, so a
+    later regression can be reverted to exactly that prior state rather than guessing.
+    """
+    with _lock:
+        conn = _get_connection()
+        try:
+            conn.execute(
+                "UPDATE sage_proposals SET baseline_signal_quality = ?, prior_override = ? WHERE id = ?",
+                (baseline_signal_quality, prior_override, proposal_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_pending_evaluation_proposal(agent: str) -> dict | None:
+    """The most recent accepted-but-not-yet-evaluated proposal for this agent, if any.
+    Returns None once outcome is set (evaluated) or if nothing has ever been accepted --
+    each proposal is only ever up for evaluation once, immediately after acceptance.
+    """
+    with _lock:
+        conn = _get_connection()
+        try:
+            row = conn.execute(
+                f"SELECT {_COLUMNS} FROM sage_proposals WHERE agent = ? AND status = 'accepted' AND outcome = '' "
+                "ORDER BY id DESC LIMIT 1",
+                (agent,),
+            ).fetchone()
+        finally:
+            conn.close()
+    return _row_to_dict(row) if row else None
+
+
+def record_outcome(proposal_id: int, outcome: str, reasoning: str) -> None:
+    with _lock:
+        conn = _get_connection()
+        try:
+            conn.execute(
+                "UPDATE sage_proposals SET outcome = ?, outcome_reasoning = ?, evaluated_at = ? WHERE id = ?",
+                (outcome, reasoning, datetime.now(timezone.utc).isoformat(), proposal_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()

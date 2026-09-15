@@ -390,6 +390,148 @@ def test_sage_accept_already_reviewed_proposal_is_409(client, monkeypatch):
     assert resp.status_code == 409
 
 
+def test_sage_accept_records_baseline_signal_quality_and_no_prior_override(client, monkeypatch):
+    test_api_module = sys.modules[__name__]
+
+    _seed_digest("nexus", signal_quality="Affirms short answers.")
+
+    monkeypatch.setattr(
+        test_api_module, "mock_reply_content", json.dumps({"rationale": "r", "proposed_system_prompt": "p"})
+    )
+    proposal_id = client.post("/sage/analyze/nexus", headers={"X-API-Key": VALID_KEY}).json()["id"]
+    client.post(f"/sage/proposals/{proposal_id}/accept", headers={"X-API-Key": VALID_KEY})
+
+    proposal = client.get("/sage/proposals", headers={"X-API-Key": VALID_KEY}).json()["proposals"][0]
+    assert proposal["baseline_signal_quality"] == "Affirms short answers."
+    assert proposal["prior_override"] is None
+    assert proposal["outcome"] == ""
+
+
+def test_sage_accept_records_prior_override_when_one_already_existed(client, monkeypatch):
+    test_api_module = sys.modules[__name__]
+
+    client.post(
+        "/sage/override/nexus", headers={"X-API-Key": VALID_KEY}, json={"system_prompt": "You are a pirate."}
+    )
+    _seed_digest("nexus")
+
+    monkeypatch.setattr(
+        test_api_module, "mock_reply_content", json.dumps({"rationale": "r", "proposed_system_prompt": "Be warm."})
+    )
+    proposal_id = client.post("/sage/analyze/nexus", headers={"X-API-Key": VALID_KEY}).json()["id"]
+    client.post(f"/sage/proposals/{proposal_id}/accept", headers={"X-API-Key": VALID_KEY})
+
+    proposal = client.get("/sage/proposals", headers={"X-API-Key": VALID_KEY}).json()["proposals"][0]
+    assert proposal["prior_override"] == "You are a pirate."
+
+
+def _setup_sage_loop_modules(monkeypatch, tmp_path, db_name: str):
+    from core import digest as digest_module
+    from core import memory as memory_module
+    from core import persona_overrides as persona_overrides_module
+    from core import sage_proposals as sage_proposals_module
+    from core import user_profile as user_profile_module
+
+    db_path = tmp_path / db_name
+    for module in (digest_module, memory_module, persona_overrides_module, sage_proposals_module, user_profile_module):
+        monkeypatch.setattr(module, "DB_PATH", db_path)
+        module.init_db()
+    digest_module._active_agents.clear()
+    return digest_module, memory_module, persona_overrides_module, sage_proposals_module, user_profile_module
+
+
+def test_sage_loop_reverts_override_when_evaluation_finds_regression(monkeypatch, tmp_path):
+    """End-to-end: closing the SAGE loop should actually revert a persona change once fresh
+    signal shows it made things worse -- not just record a verdict nobody acts on."""
+    import asyncio
+
+    import main as main_module
+
+    digest_module, memory_module, persona_overrides_module, sage_proposals_module, _ = _setup_sage_loop_modules(
+        monkeypatch, tmp_path, "sage_loop_regressed.db"
+    )
+
+    persona_overrides_module.set_override("nexus", "Be extremely formal.")
+    digest_module.apply_digest(
+        "nexus", "User likes formal answers.", topic_shift=False, signal_quality="Affirms formal replies."
+    )
+
+    proposal_id = sage_proposals_module.create_proposal("nexus", "try warmth instead", "Be warm and casual.")
+    sage_proposals_module.set_proposal_status(proposal_id, "accepted")
+    sage_proposals_module.record_acceptance_baseline(proposal_id, "Affirms formal replies.", "Be extremely formal.")
+    persona_overrides_module.set_override("nexus", "Be warm and casual.")
+
+    memory_module.add_message("s1", "nexus", "user", "That's too casual, please be formal.")
+
+    replies = iter(
+        [
+            json.dumps(
+                {
+                    "digest": "User dislikes the new casual tone.",
+                    "topic_shift": False,
+                    "signal_quality": "Explicitly corrected the new casual tone back to formal.",
+                }
+            ),
+            json.dumps({"profile": "Name unknown."}),
+            json.dumps({"verdict": "regressed", "reasoning": "user explicitly corrected the new tone"}),
+        ]
+    )
+
+    async def fake_call_mistral(messages):
+        return next(replies)
+
+    monkeypatch.setattr(main_module, "_call_mistral", fake_call_mistral)
+
+    asyncio.run(main_module._run_digest_safely("nexus"))
+
+    assert persona_overrides_module.get_override("nexus") == "Be extremely formal."
+    assert sage_proposals_module.get_proposal(proposal_id)["outcome"] == "regressed"
+
+
+def test_sage_loop_leaves_override_in_place_when_evaluation_finds_improvement(monkeypatch, tmp_path):
+    import asyncio
+
+    import main as main_module
+
+    digest_module, memory_module, persona_overrides_module, sage_proposals_module, _ = _setup_sage_loop_modules(
+        monkeypatch, tmp_path, "sage_loop_improved.db"
+    )
+
+    digest_module.apply_digest(
+        "nexus", "User likes formal answers.", topic_shift=False, signal_quality="Affirms formal replies."
+    )
+    proposal_id = sage_proposals_module.create_proposal("nexus", "try warmth instead", "Be warm and casual.")
+    sage_proposals_module.set_proposal_status(proposal_id, "accepted")
+    sage_proposals_module.record_acceptance_baseline(proposal_id, "Affirms formal replies.", None)
+    persona_overrides_module.set_override("nexus", "Be warm and casual.")
+
+    memory_module.add_message("s1", "nexus", "user", "That's much better, thanks!")
+
+    replies = iter(
+        [
+            json.dumps(
+                {
+                    "digest": "User likes the new casual tone.",
+                    "topic_shift": False,
+                    "signal_quality": "Affirms the new casual tone.",
+                }
+            ),
+            json.dumps({"profile": "Name unknown."}),
+            json.dumps({"verdict": "improved", "reasoning": "user affirmed the new tone"}),
+        ]
+    )
+
+    async def fake_call_mistral(messages):
+        return next(replies)
+
+    monkeypatch.setattr(main_module, "_call_mistral", fake_call_mistral)
+
+    asyncio.run(main_module._run_digest_safely("nexus"))
+
+    assert persona_overrides_module.get_override("nexus") == "Be warm and casual."
+    assert sage_proposals_module.get_proposal(proposal_id)["outcome"] == "improved"
+
+
 def test_chat_without_digest_sends_only_persona_system_prompt(client):
     client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
 
@@ -485,6 +627,7 @@ def test_digest_cycle_merges_into_shared_profile(monkeypatch, tmp_path):
 
     from core import digest as digest_module
     from core import memory as memory_module
+    from core import sage_proposals as sage_proposals_module
     from core import user_profile as user_profile_module
     import main as main_module
 
@@ -492,9 +635,11 @@ def test_digest_cycle_merges_into_shared_profile(monkeypatch, tmp_path):
     monkeypatch.setattr(digest_module, "DB_PATH", db_path)
     monkeypatch.setattr(memory_module, "DB_PATH", db_path)
     monkeypatch.setattr(user_profile_module, "DB_PATH", db_path)
+    monkeypatch.setattr(sage_proposals_module, "DB_PATH", db_path)
     digest_module.init_db()
     memory_module.init_db()
     user_profile_module.init_db()
+    sage_proposals_module.init_db()
     digest_module._active_agents.clear()
 
     memory_module.add_message("s1", "nexus", "user", "My name is Lee.")
