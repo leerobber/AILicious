@@ -72,3 +72,88 @@ def test_set_proposal_status_on_already_reviewed_proposal_returns_false():
 
     assert sp_module.set_proposal_status(proposal_id, "rejected") is False
     assert sp_module.get_proposal(proposal_id)["status"] == "accepted"
+
+
+def test_new_proposal_has_empty_outcome_fields():
+    proposal_id = sp_module.create_proposal("nexus", "r", "p")
+
+    proposal = sp_module.get_proposal(proposal_id)
+    assert proposal["baseline_signal_quality"] is None
+    assert proposal["prior_override"] is None
+    assert proposal["outcome"] == ""
+    assert proposal["outcome_reasoning"] is None
+    assert proposal["evaluated_at"] is None
+
+
+def test_record_acceptance_baseline_stores_snapshot():
+    proposal_id = sp_module.create_proposal("nexus", "r", "p")
+    sp_module.set_proposal_status(proposal_id, "accepted")
+
+    sp_module.record_acceptance_baseline(proposal_id, "user likes concise answers", "You are a pirate.")
+
+    proposal = sp_module.get_proposal(proposal_id)
+    assert proposal["baseline_signal_quality"] == "user likes concise answers"
+    assert proposal["prior_override"] == "You are a pirate."
+
+
+def test_record_acceptance_baseline_allows_none_prior_override():
+    proposal_id = sp_module.create_proposal("nexus", "r", "p")
+    sp_module.set_proposal_status(proposal_id, "accepted")
+
+    sp_module.record_acceptance_baseline(proposal_id, "signal", None)
+
+    assert sp_module.get_proposal(proposal_id)["prior_override"] is None
+
+
+def test_get_pending_evaluation_proposal_none_when_nothing_accepted():
+    sp_module.create_proposal("nexus", "r", "p")
+
+    assert sp_module.get_pending_evaluation_proposal("nexus") is None
+
+
+def test_get_pending_evaluation_proposal_returns_accepted_unevaluated_proposal():
+    proposal_id = sp_module.create_proposal("nexus", "r", "p")
+    sp_module.set_proposal_status(proposal_id, "accepted")
+    sp_module.record_acceptance_baseline(proposal_id, "signal", None)
+
+    pending = sp_module.get_pending_evaluation_proposal("nexus")
+    assert pending["id"] == proposal_id
+
+
+def test_get_pending_evaluation_proposal_scoped_to_agent():
+    proposal_id = sp_module.create_proposal("forge", "r", "p")
+    sp_module.set_proposal_status(proposal_id, "accepted")
+    sp_module.record_acceptance_baseline(proposal_id, "signal", None)
+
+    assert sp_module.get_pending_evaluation_proposal("nexus") is None
+    assert sp_module.get_pending_evaluation_proposal("forge")["id"] == proposal_id
+
+
+def test_get_pending_evaluation_proposal_none_after_outcome_recorded():
+    proposal_id = sp_module.create_proposal("nexus", "r", "p")
+    sp_module.set_proposal_status(proposal_id, "accepted")
+    sp_module.record_acceptance_baseline(proposal_id, "signal", None)
+
+    sp_module.record_outcome(proposal_id, "improved", "things got better")
+
+    assert sp_module.get_pending_evaluation_proposal("nexus") is None
+
+
+def test_record_outcome_sets_fields():
+    proposal_id = sp_module.create_proposal("nexus", "r", "p")
+    sp_module.set_proposal_status(proposal_id, "accepted")
+    sp_module.record_acceptance_baseline(proposal_id, "signal", None)
+
+    sp_module.record_outcome(proposal_id, "regressed", "signal got worse")
+
+    proposal = sp_module.get_proposal(proposal_id)
+    assert proposal["outcome"] == "regressed"
+    assert proposal["outcome_reasoning"] == "signal got worse"
+    assert proposal["evaluated_at"] is not None
+
+
+def test_get_pending_evaluation_proposal_ignores_rejected_proposals():
+    proposal_id = sp_module.create_proposal("nexus", "r", "p")
+    sp_module.set_proposal_status(proposal_id, "rejected")
+
+    assert sp_module.get_pending_evaluation_proposal("nexus") is None

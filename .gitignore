@@ -5,3 +5,4 @@ venv/
 .venv/
 backend/data/
 .pytest_cache/
+backend/evals/results/

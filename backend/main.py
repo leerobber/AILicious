@@ -18,8 +18,10 @@ from core.persona import get_system_prompt, has_persona, list_personas, load_per
 from core.persona_overrides import clear_override, get_override, set_override
 from core.persona_overrides import init_db as init_persona_overrides_db
 from core.ratelimit import check_rate_limit
+from core.sage_evaluation import run_pending_evaluation
 from core.sage_proposals import create_proposal, get_proposal, list_proposals, set_proposal_status
 from core.sage_proposals import init_db as init_sage_proposals_db
+from core.sage_proposals import record_acceptance_baseline
 from core.user_profile import get_profile_state, run_profile_merge
 from core.user_profile import get_profile as get_user_profile
 from core.user_profile import init_db as init_user_profile_db
@@ -336,8 +338,9 @@ def _schedule_digest(agent: str) -> None:
 async def _run_digest_safely(agent: str) -> None:
     digested = await run_digest_cycle(agent, _call_mistral)
     if digested:
-        agent_digest = await asyncio.to_thread(get_digest_text, agent)
-        await run_profile_merge(agent, agent_digest, _call_mistral)
+        state = await asyncio.to_thread(get_digest_state, agent)
+        await run_profile_merge(agent, state["digest"], _call_mistral)
+        await run_pending_evaluation(agent, state["signal_quality"], _call_mistral)
 
 
 async def run_agent_chat(agent: str, message: str, session_id: str | None) -> ChatResponse:
@@ -571,12 +574,18 @@ async def sage_accept_proposal(proposal_id: int, x_api_key: str | None = Header(
     proposal = await asyncio.to_thread(get_proposal, proposal_id)
     if proposal is None:
         raise HTTPException(status_code=404, detail=f"No SAGE proposal with id {proposal_id}")
+    prior_override = await asyncio.to_thread(get_override, proposal["agent"])
+    digest_state = await asyncio.to_thread(get_digest_state, proposal["agent"])
+
     updated = await asyncio.to_thread(set_proposal_status, proposal_id, "accepted")
     if not updated:
         raise HTTPException(
             status_code=409, detail=f"Proposal {proposal_id} is not pending (status: {proposal['status']})"
         )
     await asyncio.to_thread(set_override, proposal["agent"], proposal["proposed_system_prompt"])
+    await asyncio.to_thread(
+        record_acceptance_baseline, proposal_id, digest_state["signal_quality"], prior_override
+    )
     return {"status": "accepted"}
 
 
