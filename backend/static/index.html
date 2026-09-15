@@ -331,7 +331,20 @@
   dialog#sage { max-width: 440px; max-height: calc(100% - 64px); overflow-y: auto; }
   dialog#settings::backdrop, dialog#sage::backdrop { background: rgba(4, 8, 20, 0.7); backdrop-filter: blur(2px); }
   dialog#settings h2, dialog#sage h2 { margin-top: 0; font-size: 17px; }
-  dialog#settings label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 6px; }
+  dialog#settings label, dialog#sage label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 6px; }
+  .profile-preview {
+    font-size: 13px;
+    color: var(--text-dim);
+    white-space: pre-wrap;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 16px;
+    max-height: 140px;
+    overflow-y: auto;
+    line-height: 1.5;
+  }
   dialog#settings input[type="password"] {
     width: 100%;
     background: var(--panel-2);
@@ -392,6 +405,30 @@
   .proposal-card button.reject { background: transparent; color: var(--error); border: 1px solid var(--error); }
   .proposal-card button.reject:hover { background: rgba(251, 113, 133, 0.1); }
   .no-proposals { font-size: 13px; color: var(--text-dim); text-align: center; padding: 12px 0; }
+
+  .history-list { display: flex; flex-direction: column; gap: 8px; }
+  .history-item {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 13px;
+  }
+  .history-rationale { color: var(--text-dim); margin-top: 6px; }
+  .history-reasoning { color: var(--text-dim); margin-top: 4px; font-style: italic; }
+  .outcome-badge {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    border-radius: 999px;
+    padding: 3px 9px;
+  }
+  .outcome-improved { background: rgba(74, 222, 128, 0.2); color: var(--success); }
+  .outcome-regressed { background: rgba(251, 113, 133, 0.2); color: var(--error); }
+  .outcome-pending, .outcome-unclear { background: var(--bg-2); color: var(--text-dim); }
+  .outcome-rejected { background: var(--bg-2); color: var(--text-dim); }
 </style>
 </head>
 <body>
@@ -441,6 +478,8 @@
       spellcheck="false"
     />
     <div id="key-status" style="font-size: 13px; margin: 0 0 16px; min-height: 16px;"></div>
+    <label>What AILicious knows about you (shared across every agent)</label>
+    <div class="profile-preview" id="profile-preview">—</div>
     <div class="row">
       <button type="button" class="cancel" id="open-sage">Persona (SAGE)</button>
       <button type="button" class="danger" id="clear-history">Clear this agent's chat</button>
@@ -459,6 +498,10 @@
     </div>
     <div class="sage-section">
       <div id="sage-proposals" class="proposal-list"></div>
+    </div>
+    <div class="sage-section">
+      <label>History — did an accepted change actually help?</label>
+      <div id="sage-history" class="history-list"></div>
     </div>
     <div class="row">
       <button type="button" class="danger" id="sage-reset">Reset persona to default</button>
@@ -494,6 +537,7 @@
     const settingsCancel = document.getElementById("settings-cancel");
     const clearHistoryBtn = document.getElementById("clear-history");
     const keyStatusEl = document.getElementById("key-status");
+    const profilePreviewEl = document.getElementById("profile-preview");
     const openSageBtn = document.getElementById("open-sage");
     const sageDialog = document.getElementById("sage");
     const sageAgentNameEl = document.getElementById("sage-agent-name");
@@ -501,6 +545,7 @@
     const sageAnalyzeBtn = document.getElementById("sage-analyze");
     const sageAnalyzeStatusEl = document.getElementById("sage-analyze-status");
     const sageProposalsEl = document.getElementById("sage-proposals");
+    const sageHistoryEl = document.getElementById("sage-history");
     const sageResetBtn = document.getElementById("sage-reset");
 
     function storageKey(agent, suffix) {
@@ -729,10 +774,30 @@
       keyStatusEl.style.color = color;
     }
 
+    async function loadProfilePreview() {
+      const key = getApiKey();
+      if (!key) {
+        profilePreviewEl.textContent = "Save an API key to see this.";
+        return;
+      }
+      profilePreviewEl.textContent = "Loading…";
+      try {
+        const resp = await fetch(`${API_BASE}/profile`, { headers: { "X-API-Key": key } });
+        if (!resp.ok) throw new Error(`request failed (${resp.status})`);
+        const data = await resp.json();
+        profilePreviewEl.textContent = data.profile
+          ? data.profile
+          : "Nothing learned yet — chat with any agent for a while, then check back.";
+      } catch (err) {
+        profilePreviewEl.textContent = `Couldn't load: ${err.message}`;
+      }
+    }
+
     settingsBtn.addEventListener("click", () => {
       apiKeyInput.value = getApiKey();
       setKeyStatus("", "");
       settingsDialog.showModal();
+      loadProfilePreview();
     });
 
     settingsCancel.addEventListener("click", () => settingsDialog.close());
@@ -748,6 +813,7 @@
         const resp = await fetch(`${API_BASE}/agents`, { headers: { "X-API-Key": key } });
         if (resp.ok) {
           setKeyStatus("✓ Key works — saved.", "var(--success)");
+          loadProfilePreview();
           setTimeout(() => settingsDialog.close(), 700);
         } else if (resp.status === 401) {
           setKeyStatus("✗ Server rejected this key (401). Check for typos or extra spaces.", "var(--error)");
@@ -883,8 +949,9 @@
             headers: { "X-API-Key": getApiKey() },
           });
           if (!resp.ok) throw new Error(`request failed (${resp.status})`);
-          card.remove();
-          if (!sageProposalsEl.children.length) renderNoProposals();
+          // Reload rather than just removing the card -- the decision also needs to show
+          // up immediately in the history section below, not just disappear from pending.
+          await loadProposals();
         } catch (err) {
           acceptBtn.disabled = false;
           rejectBtn.disabled = false;
@@ -909,31 +976,83 @@
       return data.system_prompt;
     }
 
+    // Maps a reviewed proposal to a short, plain-language badge. Rejected proposals never
+    // got an override applied, so there's nothing to evaluate -- outcome only means
+    // anything for an accepted one, and stays "evaluating" until the next digest cycle
+    // for that agent actually judges it (core.sage_evaluation.run_pending_evaluation).
+    function outcomeBadge(proposal) {
+      if (proposal.status === "rejected") {
+        return { text: "Rejected", cls: "outcome-rejected" };
+      }
+      if (proposal.outcome === "regressed") return { text: "Reverted — made things worse", cls: "outcome-regressed" };
+      if (proposal.outcome === "improved") return { text: "Kept — helped", cls: "outcome-improved" };
+      if (proposal.outcome === "unclear") return { text: "Kept — too soon to tell", cls: "outcome-unclear" };
+      return { text: "Accepted — evaluating…", cls: "outcome-pending" };
+    }
+
+    function renderProposalHistory(proposals) {
+      sageHistoryEl.innerHTML = "";
+      if (!proposals.length) {
+        sageHistoryEl.innerHTML = '<div class="no-proposals">No reviewed proposals yet.</div>';
+        return;
+      }
+      for (const proposal of proposals) {
+        const item = document.createElement("div");
+        item.className = "history-item";
+
+        const badgeInfo = outcomeBadge(proposal);
+        const badge = document.createElement("span");
+        badge.className = `outcome-badge ${badgeInfo.cls}`;
+        badge.textContent = badgeInfo.text;
+        item.appendChild(badge);
+
+        const rationale = document.createElement("div");
+        rationale.className = "history-rationale";
+        rationale.textContent = proposal.rationale;
+        item.appendChild(rationale);
+
+        if (proposal.outcome_reasoning) {
+          const reasoning = document.createElement("div");
+          reasoning.className = "history-reasoning";
+          reasoning.textContent = proposal.outcome_reasoning;
+          item.appendChild(reasoning);
+        }
+
+        sageHistoryEl.appendChild(item);
+      }
+    }
+
     async function loadProposals() {
       const agent = currentAgent();
       sageProposalsEl.innerHTML = '<div class="no-proposals">Loading…</div>';
+      sageHistoryEl.innerHTML = "";
       try {
-        const resp = await fetch(`${API_BASE}/sage/proposals?agent=${agent}&status=pending`, {
+        const resp = await fetch(`${API_BASE}/sage/proposals?agent=${agent}`, {
           headers: { "X-API-Key": getApiKey() },
         });
         if (!resp.ok) throw new Error(`request failed (${resp.status})`);
         const data = await resp.json();
+        const pending = data.proposals.filter((p) => p.status === "pending");
+        const reviewed = data.proposals.filter((p) => p.status !== "pending");
+
         sageProposalsEl.innerHTML = "";
-        if (!data.proposals.length) {
+        if (!pending.length) {
           renderNoProposals();
-          return;
+        } else {
+          // Best-effort: a diff needs the current prompt, but a proposal is still reviewable
+          // without one -- renderProposalCard falls back to a plain preview if this is undefined.
+          let currentSystemPrompt;
+          try {
+            currentSystemPrompt = await fetchCurrentSystemPrompt(agent);
+          } catch {
+            currentSystemPrompt = undefined;
+          }
+          for (const proposal of pending) {
+            sageProposalsEl.appendChild(renderProposalCard(proposal, currentSystemPrompt));
+          }
         }
-        // Best-effort: a diff needs the current prompt, but a proposal is still reviewable
-        // without one -- renderProposalCard falls back to a plain preview if this is undefined.
-        let currentSystemPrompt;
-        try {
-          currentSystemPrompt = await fetchCurrentSystemPrompt(agent);
-        } catch {
-          currentSystemPrompt = undefined;
-        }
-        for (const proposal of data.proposals) {
-          sageProposalsEl.appendChild(renderProposalCard(proposal, currentSystemPrompt));
-        }
+
+        renderProposalHistory(reviewed);
       } catch (err) {
         renderNoProposals(`Couldn't load proposals: ${err.message}`);
       }
