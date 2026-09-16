@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from core import digest as digest_module
+from core import events as events_module
 from core import memory as memory_module
 
 
@@ -13,8 +14,10 @@ def isolated_db(tmp_path, monkeypatch):
     db_path = tmp_path / "test_digest.db"
     monkeypatch.setattr(digest_module, "DB_PATH", db_path)
     monkeypatch.setattr(memory_module, "DB_PATH", db_path)
+    monkeypatch.setattr(events_module, "DB_PATH", db_path)
     digest_module.init_db()
     memory_module.init_db()
+    events_module.init_db()
     digest_module._active_agents.clear()
     yield
     digest_module._active_agents.clear()
@@ -263,6 +266,54 @@ def test_run_digest_cycle_skips_when_already_in_flight():
 
     assert result is False
     assert calls == []
+
+
+def test_run_digest_cycle_records_applied_event_on_success():
+    memory_module.add_message("s1", "nexus", "user", "hello")
+
+    async def fake_call_mistral(messages):
+        return json.dumps({"digest": "x", "topic_shift": True})
+
+    _run(digest_module.run_digest_cycle("nexus", fake_call_mistral))
+
+    events = events_module.list_events(category="digest", agent="nexus")
+    assert events[0]["event"] == "applied"
+    assert "topic_shift=True" in events[0]["detail"]
+
+
+def test_run_digest_cycle_records_failed_event_on_malformed_response():
+    memory_module.add_message("s1", "nexus", "user", "hello")
+
+    async def fake_call_mistral(messages):
+        return "this is not JSON"
+
+    _run(digest_module.run_digest_cycle("nexus", fake_call_mistral))
+
+    events = events_module.list_events(category="digest", agent="nexus")
+    assert events[0]["event"] == "failed"
+
+
+def test_run_digest_cycle_records_skipped_coalescing_event():
+    memory_module.add_message("s1", "nexus", "user", "hello")
+    digest_module.try_acquire("nexus")
+
+    async def fake_call_mistral(messages):
+        return json.dumps({"digest": "x", "topic_shift": False})
+
+    _run(digest_module.run_digest_cycle("nexus", fake_call_mistral))
+
+    events = events_module.list_events(category="digest", agent="nexus")
+    assert events[0]["event"] == "skipped_coalescing"
+
+
+def test_run_digest_cycle_records_skipped_no_new_turns_event():
+    async def fake_call_mistral(messages):
+        return json.dumps({"digest": "x", "topic_shift": False})
+
+    _run(digest_module.run_digest_cycle("nexus", fake_call_mistral))
+
+    events = events_module.list_events(category="digest", agent="nexus")
+    assert events[0]["event"] == "skipped_no_new_turns"
 
 
 def test_run_digest_cycle_incremental_only_sends_new_turns():

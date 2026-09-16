@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from core import events as events_module
 from core import persona_overrides as persona_overrides_module
 from core import sage_evaluation as sage_evaluation_module
 from core import sage_proposals as sage_proposals_module
@@ -13,8 +14,10 @@ def isolated_db(tmp_path, monkeypatch):
     db_path = tmp_path / "test_sage_evaluation.db"
     monkeypatch.setattr(sage_proposals_module, "DB_PATH", db_path)
     monkeypatch.setattr(persona_overrides_module, "DB_PATH", db_path)
+    monkeypatch.setattr(events_module, "DB_PATH", db_path)
     sage_proposals_module.init_db()
     persona_overrides_module.init_db()
+    events_module.init_db()
     yield
 
 
@@ -146,3 +149,53 @@ def test_sends_rationale_and_both_signal_quality_reads_to_judge():
     assert "old read" in sent_content
     assert "new read" in sent_content
     assert "rationale" in sent_content
+
+
+def test_records_evaluated_event_with_verdict():
+    _accepted_proposal(prior_override=None)
+
+    async def fake_call_mistral(messages):
+        return json.dumps({"verdict": "improved", "reasoning": "went well"})
+
+    _run(sage_evaluation_module.run_pending_evaluation("nexus", "signal", fake_call_mistral))
+
+    events = events_module.list_events(category="sage", agent="nexus")
+    applied = [e for e in events if e["event"] == "evaluated"]
+    assert len(applied) == 1
+    assert "verdict=improved" in applied[0]["detail"]
+
+
+def test_records_reverted_event_only_on_regression():
+    _accepted_proposal(prior_override="You are a pirate.")
+
+    async def fake_call_mistral(messages):
+        return json.dumps({"verdict": "regressed", "reasoning": "went badly"})
+
+    _run(sage_evaluation_module.run_pending_evaluation("nexus", "signal", fake_call_mistral))
+
+    events = events_module.list_events(category="sage", agent="nexus")
+    assert any(e["event"] == "reverted" for e in events)
+
+
+def test_does_not_record_reverted_event_when_not_regressed():
+    _accepted_proposal(prior_override=None)
+
+    async def fake_call_mistral(messages):
+        return json.dumps({"verdict": "improved", "reasoning": "went well"})
+
+    _run(sage_evaluation_module.run_pending_evaluation("nexus", "signal", fake_call_mistral))
+
+    events = events_module.list_events(category="sage", agent="nexus")
+    assert not any(e["event"] == "reverted" for e in events)
+
+
+def test_records_evaluation_failed_event_on_malformed_response():
+    _accepted_proposal(prior_override=None)
+
+    async def fake_call_mistral(messages):
+        return "not json"
+
+    _run(sage_evaluation_module.run_pending_evaluation("nexus", "signal", fake_call_mistral))
+
+    events = events_module.list_events(category="sage", agent="nexus")
+    assert events[0]["event"] == "evaluation_failed"

@@ -36,6 +36,7 @@ scheduled_embeddings: list[tuple[int, str]] = []
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     from core import digest as digest_module
+    from core import events as events_module
     from core import memory as memory_module
     from core import persona_overrides as persona_overrides_module
     from core import sage_proposals as sage_proposals_module
@@ -47,6 +48,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(sage_proposals_module, "DB_PATH", db_path)
     monkeypatch.setattr(digest_module, "DB_PATH", db_path)
     monkeypatch.setattr(user_profile_module, "DB_PATH", db_path)
+    monkeypatch.setattr(events_module, "DB_PATH", db_path)
     digest_module._active_agents.clear()
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
     sent_requests.clear()
@@ -670,6 +672,81 @@ def test_profile_returns_applied_value(client):
     body = resp.json()
     assert body["profile"] == "Name: Lee. Works on AILicious."
     assert body["updated_at"] is not None
+
+
+def test_events_requires_api_key(client):
+    resp = client.get("/events")
+    assert resp.status_code == 401
+
+
+def test_events_empty_by_default(client):
+    resp = client.get("/events", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 200
+    assert resp.json() == {"events": []}
+
+
+def test_events_returns_recorded_events(client):
+    from core import events as events_module
+
+    events_module.record_event("digest", "applied", "nexus", "turns=10")
+
+    resp = client.get("/events", headers={"X-API-Key": VALID_KEY})
+    events = resp.json()["events"]
+    assert len(events) == 1
+    assert events[0]["category"] == "digest"
+    assert events[0]["event"] == "applied"
+    assert events[0]["agent"] == "nexus"
+
+
+def test_events_filters_by_category_and_agent(client):
+    from core import events as events_module
+
+    events_module.record_event("digest", "applied", "nexus")
+    events_module.record_event("sage", "evaluated", "forge")
+
+    resp = client.get("/events", headers={"X-API-Key": VALID_KEY}, params={"category": "sage"})
+    assert [e["category"] for e in resp.json()["events"]] == ["sage"]
+
+    resp = client.get("/events", headers={"X-API-Key": VALID_KEY}, params={"agent": "forge"})
+    assert [e["agent"] for e in resp.json()["events"]] == ["forge"]
+
+
+def test_embed_and_store_records_stored_event_on_success(client, monkeypatch):
+    import asyncio
+
+    import main as main_module
+    from core import events as events_module
+    from core import memory as memory_module
+
+    message_id = memory_module.add_message("s1", "nexus", "user", "hello")
+
+    async def fake_embed_text(text):
+        return [1.0, 0.0]
+
+    monkeypatch.setattr(main_module, "_embed_text", fake_embed_text)
+
+    asyncio.run(main_module._embed_and_store(message_id, "hello"))
+
+    events = events_module.list_events(category="embedding")
+    assert events[0]["event"] == "stored"
+    assert f"message_id={message_id}" in events[0]["detail"]
+
+
+def test_embed_and_store_records_failed_event_when_embedding_unavailable(client, monkeypatch):
+    import asyncio
+
+    import main as main_module
+    from core import events as events_module
+
+    async def fake_embed_text(text):
+        return None
+
+    monkeypatch.setattr(main_module, "_embed_text", fake_embed_text)
+
+    asyncio.run(main_module._embed_and_store(999, "hello"))
+
+    events = events_module.list_events(category="embedding")
+    assert events[0]["event"] == "failed"
 
 
 def test_chat_includes_profile_in_outgoing_system_prompt_when_present(client):

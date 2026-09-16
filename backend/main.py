@@ -14,6 +14,8 @@ from pydantic import BaseModel
 from core.digest import get_digest_text, get_state as get_digest_state, note_turns, run_digest_cycle, should_digest
 from core.digest import init_db as init_digest_db
 from core.embeddings import top_k_similar
+from core.events import list_events, record_event
+from core.events import init_db as init_events_db
 from core.memory import add_message, get_embedded_messages, get_history, get_recent_message_ids, get_stats
 from core.memory import init_db, set_embedding, set_feedback
 from core.persona import get_system_prompt, has_persona, list_personas, load_personas
@@ -52,6 +54,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(init_sage_proposals_db)
     await asyncio.to_thread(init_digest_db)
     await asyncio.to_thread(init_user_profile_db)
+    await asyncio.to_thread(init_events_db)
     await asyncio.to_thread(load_personas)
     yield
 
@@ -163,6 +166,9 @@ async def _embed_and_store(message_id: int, content: str) -> None:
     embedding = await _embed_text(content)
     if embedding is not None:
         await asyncio.to_thread(set_embedding, message_id, embedding)
+        await asyncio.to_thread(record_event, "embedding", "stored", None, f"message_id={message_id}")
+    else:
+        await asyncio.to_thread(record_event, "embedding", "failed", None, f"message_id={message_id}")
 
 
 # Real agent-to-agent delegation: NEXUS gets a tool letting it hand a task to one of the
@@ -515,6 +521,19 @@ async def memory_stats(x_api_key: str | None = Header(default=None)) -> dict:
 async def profile(x_api_key: str | None = Header(default=None)) -> dict:
     require_api_key(x_api_key)
     return await asyncio.to_thread(get_profile_state)
+
+
+@app.get("/events")
+async def events(
+    category: str | None = None, agent: str | None = None, x_api_key: str | None = Header(default=None)
+) -> dict:
+    """A persisted, queryable trail for the background cycles (digest, profile merge, SAGE
+    evaluation, embedding) -- `category` is one of "digest"/"profile"/"sage"/"embedding".
+    Render's own logs still hold request-level detail; this answers "did a cycle fire, and
+    what happened" without needing them.
+    """
+    require_api_key(x_api_key)
+    return {"events": await asyncio.to_thread(list_events, category, agent)}
 
 
 @app.post("/chat", response_model=ChatResponse)
