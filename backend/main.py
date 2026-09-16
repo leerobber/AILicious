@@ -13,7 +13,9 @@ from pydantic import BaseModel
 
 from core.digest import get_digest_text, get_state as get_digest_state, note_turns, run_digest_cycle, should_digest
 from core.digest import init_db as init_digest_db
-from core.memory import add_message, get_history, get_stats, init_db, set_feedback
+from core.embeddings import top_k_similar
+from core.memory import add_message, get_embedded_messages, get_history, get_recent_message_ids, get_stats
+from core.memory import init_db, set_embedding, set_feedback
 from core.persona import get_system_prompt, has_persona, list_personas, load_personas
 from core.persona_overrides import clear_override, get_override, set_override
 from core.persona_overrides import init_db as init_persona_overrides_db
@@ -27,12 +29,15 @@ from core.user_profile import get_profile as get_user_profile
 from core.user_profile import init_db as init_user_profile_db
 
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
+MISTRAL_EMBED_URL = "https://api.mistral.ai/v1/embeddings"
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 MISTRAL_MODEL = os.environ.get("MISTRAL_MODEL", "mistral-small-latest")
+MISTRAL_EMBED_MODEL = os.environ.get("MISTRAL_EMBED_MODEL", "mistral-embed")
 APP_API_KEY = os.environ.get("APP_API_KEY")
 TAVILY_API_URL = "https://api.tavily.com/search"
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")  # optional: web search tool is omitted if unset
 RECENT_TAIL_LIMIT = 6  # short raw window; the conversation digest carries the rest
+SEMANTIC_RECALL_LIMIT = 4  # extra older messages surfaced by similarity, beyond the flat recency tail
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "20"))
 MAX_MESSAGE_LENGTH = int(os.environ.get("MAX_MESSAGE_LENGTH", "4000"))
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -119,6 +124,45 @@ async def _call_mistral_raw(messages: list[dict], tools: list[dict] | None = Non
 async def _call_mistral(messages: list[dict]) -> str:
     data = await _call_mistral_raw(messages)
     return data["choices"][0]["message"]["content"]
+
+
+async def _embed_text(text: str) -> list[float] | None:
+    """Best-effort: an embedding failure (no key, network error, malformed response) must
+    never break a chat turn or a background storage task -- returns None instead of raising,
+    and every caller treats None as "skip semantic recall/storage this time," same posture
+    as the rest of this file's best-effort background work (digest, profile, SAGE eval).
+    """
+    if not MISTRAL_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                MISTRAL_EMBED_URL,
+                json={"model": MISTRAL_EMBED_MODEL, "input": [text]},
+                headers={"Authorization": f"Bearer {MISTRAL_API_KEY}"},
+            )
+            resp.raise_for_status()
+        return resp.json()["data"][0]["embedding"]
+    except Exception:
+        return None
+
+
+def _schedule_embedding(message_id: int, content: str) -> None:
+    """Fires embedding computation in the background after a message is stored -- never
+    awaited by the request that triggers it, so it adds zero latency to that chat response.
+    (Retrieving *for* the current turn is a separate, synchronous _embed_text call in
+    run_agent_chat -- that one's latency is unavoidable, since the result has to inform
+    this turn's own request.)
+    """
+    task = asyncio.create_task(_embed_and_store(message_id, content))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _embed_and_store(message_id: int, content: str) -> None:
+    embedding = await _embed_text(content)
+    if embedding is not None:
+        await asyncio.to_thread(set_embedding, message_id, embedding)
 
 
 # Real agent-to-agent delegation: NEXUS gets a tool letting it hand a task to one of the
@@ -359,6 +403,21 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
     override = await asyncio.to_thread(get_override, agent)
     system_prompt = override if override is not None else get_system_prompt(agent)
 
+    # Semantic recall: the digest is a lossy compressed summary, and the recency tail is
+    # only the last few turns -- a specific detail from well outside both can still be
+    # exactly what this message needs. Embedding the incoming message adds one real Mistral
+    # round-trip to this turn's latency (unlike everything else below, which is either
+    # already-stored text or a background task) -- the tradeoff is inherent to retrieving
+    # *for this turn*, not a bug. Best-effort throughout: any failure (no key, network,
+    # nothing embedded yet) just means no semantic context this turn, never a broken chat.
+    query_embedding = await _embed_text(message)
+    semantic_context: list[dict] = []
+    if query_embedding is not None:
+        recent_ids = await asyncio.to_thread(get_recent_message_ids, session_id, agent, RECENT_TAIL_LIMIT)
+        candidates = await asyncio.to_thread(get_embedded_messages, agent, recent_ids)
+        if candidates:
+            semantic_context = top_k_similar(query_embedding, candidates, SEMANTIC_RECALL_LIMIT)
+
     messages = [{"role": "system", "content": system_prompt}]
     if profile_text:
         messages.append(
@@ -366,6 +425,10 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
         )
     if digest_text:
         messages.append({"role": "system", "content": f"What you specifically know from your own conversations with this user:\n{digest_text}"})
+    if semantic_context:
+        lines = ["Potentially relevant exchanges from earlier (not already shown above), most relevant first:"]
+        lines += [f"{turn['role']}: {turn['content']}" for turn in semantic_context]
+        messages.append({"role": "system", "content": "\n".join(lines)})
     messages += recent_tail + [{"role": "user", "content": message}]
 
     if agent == "nexus":
@@ -373,8 +436,10 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
     else:
         reply, delegated_to, searched_web = await _call_mistral(messages), [], []
 
-    await asyncio.to_thread(add_message, session_id, agent, "user", message)
+    user_message_id = await asyncio.to_thread(add_message, session_id, agent, "user", message)
     message_id = await asyncio.to_thread(add_message, session_id, agent, "assistant", reply)
+    _schedule_embedding(user_message_id, message)
+    _schedule_embedding(message_id, reply)
 
     # Bookkeeping for the next digest cycle -- note_turns compares request_started_at
     # (captured before the Mistral call) against the *previous* exchange's timestamp,

@@ -1,3 +1,4 @@
+import json
 import threading
 from datetime import datetime, timezone
 
@@ -42,6 +43,14 @@ def init_db() -> None:
                 # forcing a table rebuild against the live Turso DB isn't worth the risk
                 # for a column that's simply unused going forward.
                 conn.execute("ALTER TABLE messages ADD COLUMN utility_score REAL NOT NULL DEFAULT 0.0")
+            except ValueError:
+                pass  # column already exists (fresh table, or already migrated)
+            try:
+                # Semantic recall: a JSON-serialized embedding vector, computed in the
+                # background after a message is stored (core.embeddings + main._schedule_embedding).
+                # NULL until that background task completes, so retrieval only ever considers
+                # messages that actually have one -- no backfill needed for old rows.
+                conn.execute("ALTER TABLE messages ADD COLUMN embedding TEXT")
             except ValueError:
                 pass  # column already exists (fresh table, or already migrated)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_agent ON messages(session_id, agent)")
@@ -127,6 +136,58 @@ def get_messages_since(agent: str, since: str | None) -> list[dict]:
         finally:
             conn.close()
     return [{"role": role, "content": content, "feedback": feedback} for role, content, feedback in rows]
+
+
+def get_recent_message_ids(session_id: str, agent: str, limit: int) -> set[int]:
+    """Ids of the flat recency tail (see get_history) for this exact session -- used only
+    to exclude those messages from semantic recall, so the same exchange never gets shown
+    to the model twice under two different framings.
+    """
+    with _lock:
+        conn = _get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND agent = ? ORDER BY id DESC LIMIT ?",
+                (session_id, agent, limit),
+            ).fetchall()
+        finally:
+            conn.close()
+    return {row[0] for row in rows}
+
+
+def set_embedding(message_id: int, embedding: list[float]) -> None:
+    with _lock:
+        conn = _get_connection()
+        try:
+            conn.execute("UPDATE messages SET embedding = ? WHERE id = ?", (json.dumps(embedding), message_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_embedded_messages(agent: str, exclude_ids: set[int]) -> list[dict]:
+    """Messages for this agent that already have a stored embedding, for semantic-similarity
+    retrieval -- deliberately cross-session like get_messages_since (a relevant exchange from
+    a different conversation is still useful context), unlike the flat recency tail which
+    stays scoped to the current session. Capped to the 500 most recent embedded messages --
+    plenty for a single-user app, and bounds the cost of the Python-side similarity pass
+    (core.embeddings.top_k_similar) that runs against whatever this returns.
+    """
+    with _lock:
+        conn = _get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT id, role, content, embedding FROM messages WHERE agent = ? AND embedding IS NOT NULL "
+                "ORDER BY id DESC LIMIT 500",
+                (agent,),
+            ).fetchall()
+        finally:
+            conn.close()
+    return [
+        {"id": row[0], "role": row[1], "content": row[2], "embedding": json.loads(row[3])}
+        for row in rows
+        if row[0] not in exclude_ids
+    ]
 
 
 def get_stats() -> dict:

@@ -30,6 +30,7 @@ def _reset_rate_limit_state():
 
 
 scheduled_digest_agents: list[str] = []
+scheduled_embeddings: list[tuple[int, str]] = []
 
 
 @pytest.fixture
@@ -60,6 +61,23 @@ def client(tmp_path, monkeypatch):
     # directly (see test_digest.py) rather than relying on background timing here.
     scheduled_digest_agents.clear()
     monkeypatch.setattr(main_module, "_schedule_digest", scheduled_digest_agents.append)
+
+    # Same reasoning as digest scheduling above -- embedding is also fire-and-forget
+    # (asyncio.create_task in main._schedule_embedding). Tests that care about scheduling
+    # assert against this recorder; tests that need real semantic-recall behavior seed an
+    # embedding directly via core.memory.set_embedding instead of relying on background timing.
+    scheduled_embeddings.clear()
+    monkeypatch.setattr(main_module, "_schedule_embedding", lambda mid, content: scheduled_embeddings.append((mid, content)))
+
+    # run_agent_chat also calls _embed_text synchronously (for this turn's own semantic
+    # recall, not background storage) -- stubbed to a no-op None here for the same reason:
+    # every other test's sequenced_post mock indexes call_log by position, and a real HTTP
+    # call to a third endpoint they don't know about would shift those indices. Tests that
+    # need to verify real semantic-recall behavior override this locally instead.
+    async def _no_embedding(text):
+        return None
+
+    monkeypatch.setattr(main_module, "_embed_text", _no_embedding)
 
     with TestClient(app) as c:
         yield c
@@ -565,6 +583,71 @@ def test_chat_schedules_digest_once_threshold_crossed(client, monkeypatch):
 
     client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "two"})
     assert scheduled_digest_agents == ["nexus"]
+
+
+def test_chat_schedules_embedding_for_both_user_and_assistant_messages(client):
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hello there"})
+    assistant_message_id = resp.json()["message_id"]
+
+    assert len(scheduled_embeddings) == 2
+    contents = [c for _, c in scheduled_embeddings]
+    assert "hello there" in contents
+    assert "mocked reply" in contents
+    assert scheduled_embeddings[1][0] == assistant_message_id
+
+
+def test_chat_surfaces_semantically_relevant_past_message(client, monkeypatch):
+    import main as main_module
+    from core import memory as memory_module
+
+    old_id = memory_module.add_message("old-session", "nexus", "user", "My favorite color is teal.")
+    memory_module.set_embedding(old_id, [1.0, 0.0, 0.0])
+
+    async def fake_embed_text(text):
+        return [1.0, 0.0, 0.0]  # identical to the seeded embedding -- guaranteed top match
+
+    monkeypatch.setattr(main_module, "_embed_text", fake_embed_text)
+
+    client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "What's my favorite color?"})
+
+    system_contents = [m["content"] for m in sent_requests[-1]["messages"] if m["role"] == "system"]
+    assert any("My favorite color is teal." in c for c in system_contents)
+
+
+def test_chat_omits_semantic_recall_system_message_when_nothing_embedded_yet(client, monkeypatch):
+    import main as main_module
+
+    async def fake_embed_text(text):
+        return [1.0, 0.0, 0.0]
+
+    monkeypatch.setattr(main_module, "_embed_text", fake_embed_text)
+
+    client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+
+    system_contents = [m["content"] for m in sent_requests[-1]["messages"] if m["role"] == "system"]
+    assert not any("Potentially relevant exchanges" in c for c in system_contents)
+
+
+def test_chat_excludes_recent_tail_messages_from_semantic_recall(client, monkeypatch):
+    """A message already in the flat recency tail must not also show up in the semantic
+    recall block -- that would show the model the same exchange twice under two framings."""
+    import main as main_module
+    from core import memory as memory_module
+
+    recent_id = memory_module.add_message("shared-session", "nexus", "user", "recent message")
+    memory_module.set_embedding(recent_id, [1.0, 0.0])
+
+    async def fake_embed_text(text):
+        return [1.0, 0.0]
+
+    monkeypatch.setattr(main_module, "_embed_text", fake_embed_text)
+
+    client.post(
+        "/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "follow-up", "session_id": "shared-session"}
+    )
+
+    system_contents = [m["content"] for m in sent_requests[-1]["messages"] if m["role"] == "system"]
+    assert not any("Potentially relevant exchanges" in c for c in system_contents)
 
 
 def test_profile_requires_api_key(client):
