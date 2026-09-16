@@ -160,6 +160,18 @@ python -m evals.run_evals
 
 What *is* in the required pytest suite (`tests/test_eval_judge.py`, no real API key needed): the harness logic itself — verdict parsing (valid pass/fail, missing/non-string reasoning, non-boolean `passed`, malformed JSON) and a sanity check that every eval case has the required fields and a unique id. That catches a broken harness; it can't catch a broken agent — only an actual run against a real backend does that, which is exactly why this half is opt-in rather than automatic.
 
+### Observability
+
+Every background cycle in this project (KAIROS's digest, the cross-agent profile merge, SAGE's evaluation, embedding storage) runs invisibly by design — fire-and-forget, zero latency added to the response the user sees. That's also exactly what made debugging any of them, this session, mean manually grepping Render's raw stdout logs for the right line among a wall of per-request Mistral noise, repeatedly, live, under time pressure. `core/events.py` is a small, persisted, queryable trail for exactly those cycles, so "did a digest fire for nexus in the last hour, and what happened" has a real answer without that.
+
+- A single `system_events` table: `category` (`digest`/`profile`/`sage`/`embedding`), `event` (e.g. `applied`, `skipped_coalescing`, `merge_failed`, `evaluated`, `reverted`), optional `agent`, and a short free-text `detail` (e.g. `verdict=regressed proposal_id=7`).
+- `record_event()` is deliberately self-contained about being best-effort: it swallows its own exceptions rather than asking every one of its ~10 call sites (spread across `core/digest.py`, `core/user_profile.py`, `core/sage_evaluation.py`, `main.py`) to wrap it. A failure to persist the *record* of a cycle must never look like a failure of the cycle itself, and must never be the thing that breaks a chat turn three function calls away.
+- `GET /events` (optional `category`/`agent` filters) exposes the trail the same way `/sage/proposals` and `/profile` already expose their own state — queryable from a phone or a script, not just from inside Render's dashboard.
+
+Honest scope: this is a persisted event log, not a metrics/tracing system — no aggregation, no dashboards, no alerting, no latency histograms. It answers "what happened, when, to which agent" for the handful of cycles that were actually opaque this session. Render's own logs still matter for anything below that (a raw Mistral 500, a stack trace) — this doesn't replace them, it removes the need to reach for them for the common case.
+
+Tested the same way as everything else here: round-trip storage and filtering for the module itself (`test_events.py`), plus a specific assertion per real call site that the *right* event gets recorded for the *right* reason — a digest that actually applies, one that's coalesced away, one with no new turns, one that fails to parse; a profile merge that succeeds vs. fails; a SAGE evaluation that records its verdict, one that additionally reverts the override on `regressed` (and, deliberately, does *not* record a `reverted` event when the verdict isn't `regressed`); embedding storage succeeding vs. failing. Deliberate-break-confirmed on the SAGE `evaluated` event specifically: removing that `record_event` call correctly fails the test that checks for it, restored once confirmed.
+
 ### Run locally
 
 ```bash

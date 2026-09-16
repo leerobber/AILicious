@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from core.db import DB_PATH, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL
 from core.db import get_connection as _db_get_connection
+from core.events import record_event
 
 _lock = threading.Lock()
 
@@ -123,8 +124,10 @@ async def run_profile_merge(agent: str, agent_digest: str, call_mistral) -> bool
         new_profile = parsed["profile"]
         if not isinstance(new_profile, str):
             raise ValueError("profile must be a string")
-    except Exception:
+    except Exception as exc:
+        await asyncio.to_thread(record_event, "profile", "merge_failed", agent, str(exc)[:200])
         return False
 
     await asyncio.to_thread(apply_profile, new_profile)
+    await asyncio.to_thread(record_event, "profile", "merged", agent)
     return True

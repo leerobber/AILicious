@@ -1,6 +1,7 @@
 import asyncio
 import json
 
+from core.events import record_event
 from core.persona_overrides import clear_override, set_override
 from core.sage_proposals import get_pending_evaluation_proposal, record_outcome
 
@@ -60,10 +61,14 @@ async def run_pending_evaluation(agent: str, new_signal_quality: str, call_mistr
             raise ValueError(f"unrecognized verdict: {verdict!r}")
         if not isinstance(reasoning, str):
             reasoning = str(reasoning)
-    except Exception:
+    except Exception as exc:
+        await asyncio.to_thread(record_event, "sage", "evaluation_failed", agent, str(exc)[:200])
         return False
 
     await asyncio.to_thread(record_outcome, proposal["id"], verdict, reasoning)
+    await asyncio.to_thread(
+        record_event, "sage", "evaluated", agent, f"proposal_id={proposal['id']} verdict={verdict}"
+    )
 
     if verdict == "regressed":
         prior_override = proposal["prior_override"]
@@ -71,5 +76,8 @@ async def run_pending_evaluation(agent: str, new_signal_quality: str, call_mistr
             await asyncio.to_thread(clear_override, agent)
         else:
             await asyncio.to_thread(set_override, agent, prior_override)
+        await asyncio.to_thread(
+            record_event, "sage", "reverted", agent, f"proposal_id={proposal['id']}"
+        )
 
     return True

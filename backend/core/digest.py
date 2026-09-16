@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from core.db import DB_PATH, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL
 from core.db import get_connection as _db_get_connection
+from core.events import record_event
 from core.memory import get_messages_since
 
 _lock = threading.Lock()
@@ -239,11 +240,13 @@ async def run_digest_cycle(agent: str, call_mistral) -> bool:
     runs alongside. Returns True if a digest was actually produced.
     """
     if not try_acquire(agent):
+        await asyncio.to_thread(record_event, "digest", "skipped_coalescing", agent)
         return False
     try:
         state = await asyncio.to_thread(get_state, agent)
         new_turns = await asyncio.to_thread(get_messages_since, agent, state["last_digested_at"])
         if not new_turns:
+            await asyncio.to_thread(record_event, "digest", "skipped_no_new_turns", agent)
             return False
 
         messages = _build_digest_messages(state["digest"], new_turns, state["signal_quality"])
@@ -257,11 +260,15 @@ async def run_digest_cycle(agent: str, call_mistral) -> bool:
             signal_quality = parsed.get("signal_quality", state["signal_quality"])
             if not isinstance(signal_quality, str):
                 signal_quality = state["signal_quality"]
-        except Exception:
+        except Exception as exc:
             await asyncio.to_thread(record_failure, agent)
+            await asyncio.to_thread(record_event, "digest", "failed", agent, str(exc)[:200])
             return False
 
         await asyncio.to_thread(apply_digest, agent, new_digest, topic_shift, signal_quality)
+        await asyncio.to_thread(
+            record_event, "digest", "applied", agent, f"turns={len(new_turns)} topic_shift={topic_shift}"
+        )
         return True
     finally:
         release(agent)
