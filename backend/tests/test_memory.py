@@ -115,6 +115,72 @@ def test_get_stats():
     assert memory_module.get_stats() == {"total_messages": 2, "total_sessions": 2}
 
 
+def test_get_recent_message_ids_scoped_per_session_and_agent():
+    id1 = memory_module.add_message("s1", "nexus", "user", "in s1")
+    memory_module.add_message("s2", "nexus", "user", "in s2")
+    memory_module.add_message("s1", "forge", "user", "different agent")
+
+    assert memory_module.get_recent_message_ids("s1", "nexus", limit=10) == {id1}
+
+
+def test_get_recent_message_ids_respects_limit():
+    ids = [memory_module.add_message("s1", "nexus", "user", f"msg{i}") for i in range(5)]
+
+    recent = memory_module.get_recent_message_ids("s1", "nexus", limit=2)
+
+    assert recent == set(ids[-2:])
+
+
+def test_set_embedding_and_get_embedded_messages_roundtrip():
+    message_id = memory_module.add_message("s1", "nexus", "user", "my favorite color is teal")
+    memory_module.set_embedding(message_id, [1.0, 0.0, 0.0])
+
+    embedded = memory_module.get_embedded_messages("nexus", exclude_ids=set())
+
+    assert embedded == [
+        {"id": message_id, "role": "user", "content": "my favorite color is teal", "embedding": [1.0, 0.0, 0.0]}
+    ]
+
+
+def test_get_embedded_messages_excludes_messages_without_an_embedding():
+    memory_module.add_message("s1", "nexus", "user", "never embedded")
+
+    assert memory_module.get_embedded_messages("nexus", exclude_ids=set()) == []
+
+
+def test_get_embedded_messages_excludes_given_ids():
+    id1 = memory_module.add_message("s1", "nexus", "user", "a")
+    id2 = memory_module.add_message("s1", "nexus", "user", "b")
+    memory_module.set_embedding(id1, [1.0, 0.0])
+    memory_module.set_embedding(id2, [0.0, 1.0])
+
+    embedded = memory_module.get_embedded_messages("nexus", exclude_ids={id1})
+
+    assert [m["id"] for m in embedded] == [id2]
+
+
+def test_get_embedded_messages_spans_sessions():
+    id1 = memory_module.add_message("s1", "nexus", "user", "session one")
+    id2 = memory_module.add_message("s2", "nexus", "user", "session two")
+    memory_module.set_embedding(id1, [1.0])
+    memory_module.set_embedding(id2, [1.0])
+
+    embedded = memory_module.get_embedded_messages("nexus", exclude_ids=set())
+
+    assert {m["id"] for m in embedded} == {id1, id2}
+
+
+def test_get_embedded_messages_scoped_per_agent():
+    id1 = memory_module.add_message("s1", "nexus", "user", "nexus message")
+    id2 = memory_module.add_message("s1", "forge", "user", "forge message")
+    memory_module.set_embedding(id1, [1.0])
+    memory_module.set_embedding(id2, [1.0])
+
+    embedded = memory_module.get_embedded_messages("nexus", exclude_ids=set())
+
+    assert [m["id"] for m in embedded] == [id1]
+
+
 def test_init_db_is_idempotent_against_pre_agent_column_schema(tmp_path, monkeypatch):
     import libsql
 
