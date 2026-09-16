@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import json
 import os
 import uuid
@@ -11,6 +12,8 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from core.cost import get_usage_summary, record_usage
+from core.cost import init_db as init_cost_db
 from core.db import TURSO_DATABASE_URL
 from core.digest import get_digest_text, get_state as get_digest_state, note_turns, run_digest_cycle, should_digest
 from core.digest import init_db as init_digest_db
@@ -56,6 +59,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(init_digest_db)
     await asyncio.to_thread(init_user_profile_db)
     await asyncio.to_thread(init_events_db)
+    await asyncio.to_thread(init_cost_db)
     await asyncio.to_thread(load_personas)
     yield
 
@@ -101,7 +105,13 @@ def enforce_rate_limit(identifier: str) -> None:
         )
 
 
-async def _call_mistral_raw(messages: list[dict], tools: list[dict] | None = None, tool_choice: str | dict = "auto") -> dict:
+async def _call_mistral_raw(
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    tool_choice: str | dict = "auto",
+    category: str = "chat",
+    agent: str | None = None,
+) -> dict:
     if not MISTRAL_API_KEY:
         raise HTTPException(status_code=500, detail="MISTRAL_API_KEY is not configured on the server")
 
@@ -122,11 +132,22 @@ async def _call_mistral_raw(messages: list[dict], tools: list[dict] | None = Non
         except httpx.RequestError as exc:
             raise HTTPException(status_code=502, detail=f"Failed to reach Mistral API: {exc}") from exc
 
-    return resp.json()
+    data = resp.json()
+    usage = data.get("usage") or {}
+    await asyncio.to_thread(
+        record_usage,
+        category,
+        data.get("model", MISTRAL_MODEL),
+        usage.get("prompt_tokens", 0),
+        usage.get("completion_tokens", 0),
+        usage.get("total_tokens", 0),
+        agent,
+    )
+    return data
 
 
-async def _call_mistral(messages: list[dict]) -> str:
-    data = await _call_mistral_raw(messages)
+async def _call_mistral(messages: list[dict], category: str = "chat", agent: str | None = None) -> str:
+    data = await _call_mistral_raw(messages, category=category, agent=agent)
     return data["choices"][0]["message"]["content"]
 
 
@@ -146,7 +167,17 @@ async def _embed_text(text: str) -> list[float] | None:
                 headers={"Authorization": f"Bearer {MISTRAL_API_KEY}"},
             )
             resp.raise_for_status()
-        return resp.json()["data"][0]["embedding"]
+        data = resp.json()
+        usage = data.get("usage") or {}
+        await asyncio.to_thread(
+            record_usage,
+            "embedding",
+            data.get("model", MISTRAL_EMBED_MODEL),
+            usage.get("prompt_tokens", 0),
+            0,
+            usage.get("total_tokens", 0),
+        )
+        return data["data"][0]["embedding"]
     except Exception:
         return None
 
@@ -342,7 +373,7 @@ async def _run_nexus_turn(messages: list[dict], session_id: str) -> tuple[str, l
         tool_choice = (
             {"type": "function", "function": {"name": "search_web"}} if force_search and round_num == 0 else "auto"
         )
-        data = await _call_mistral_raw(conversation, tools=_nexus_tools(), tool_choice=tool_choice)
+        data = await _call_mistral_raw(conversation, tools=_nexus_tools(), tool_choice=tool_choice, agent="nexus")
         choice_message = data["choices"][0]["message"]
         tool_calls = choice_message.get("tool_calls")
 
@@ -372,7 +403,7 @@ async def _run_nexus_turn(messages: list[dict], session_id: str) -> tuple[str, l
             )
 
     # Ran out of tool-call rounds -- force a plain final answer without further tool access.
-    final = await _call_mistral(conversation)
+    final = await _call_mistral(conversation, agent="nexus")
     return final, delegated_to, searched_web
 
 
@@ -387,11 +418,15 @@ def _schedule_digest(agent: str) -> None:
 
 
 async def _run_digest_safely(agent: str) -> None:
-    digested = await run_digest_cycle(agent, _call_mistral)
+    digested = await run_digest_cycle(agent, functools.partial(_call_mistral, category="digest", agent=agent))
     if digested:
         state = await asyncio.to_thread(get_digest_state, agent)
-        await run_profile_merge(agent, state["digest"], _call_mistral)
-        await run_pending_evaluation(agent, state["signal_quality"], _call_mistral)
+        await run_profile_merge(
+            agent, state["digest"], functools.partial(_call_mistral, category="profile_merge", agent=agent)
+        )
+        await run_pending_evaluation(
+            agent, state["signal_quality"], functools.partial(_call_mistral, category="sage_evaluation", agent=agent)
+        )
 
 
 async def run_agent_chat(agent: str, message: str, session_id: str | None) -> ChatResponse:
@@ -441,7 +476,7 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
     if agent == "nexus":
         reply, delegated_to, searched_web = await _run_nexus_turn(messages, session_id)
     else:
-        reply, delegated_to, searched_web = await _call_mistral(messages), [], []
+        reply, delegated_to, searched_web = await _call_mistral(messages, agent=agent), [], []
 
     user_message_id = await asyncio.to_thread(add_message, session_id, agent, "user", message)
     message_id = await asyncio.to_thread(add_message, session_id, agent, "assistant", reply)
@@ -541,6 +576,18 @@ async def events(
     return {"events": await asyncio.to_thread(list_events, category, agent)}
 
 
+@app.get("/costs")
+async def costs(category: str | None = None, x_api_key: str | None = Header(default=None)) -> dict:
+    """Raw Mistral token usage, broken down by category ("chat"/"digest"/"profile_merge"/
+    "sage_evaluation"/"sage_analyze"/"embedding") and model. Deliberately doesn't convert to
+    a dollar figure -- per-token pricing varies by model and changes over time, and this
+    project isn't the place to keep a guessed rate from going stale. Multiply the returned
+    token counts by your own known Mistral pricing for a cost estimate.
+    """
+    require_api_key(x_api_key)
+    return await asyncio.to_thread(get_usage_summary, category)
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, request: Request, x_api_key: str | None = Header(default=None)) -> ChatResponse:
     require_api_key(x_api_key)
@@ -626,7 +673,7 @@ async def sage_analyze(agent: str, x_api_key: str | None = Header(default=None))
     current_system_prompt = override if override is not None else get_system_prompt(agent)
 
     messages = _build_sage_analysis_messages(agent, current_system_prompt, state["digest"], state["signal_quality"])
-    raw_reply = await _call_mistral(messages)
+    raw_reply = await _call_mistral(messages, category="sage_analyze", agent=agent)
 
     try:
         parsed = json.loads(raw_reply)
