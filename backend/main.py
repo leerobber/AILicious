@@ -11,6 +11,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from core.db import TURSO_DATABASE_URL
 from core.digest import get_digest_text, get_state as get_digest_state, note_turns, run_digest_cycle, should_digest
 from core.digest import init_db as init_digest_db
 from core.embeddings import top_k_similar
@@ -502,7 +503,11 @@ def _build_sage_analysis_messages(agent: str, current_system_prompt: str, digest
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "mistral_configured": bool(MISTRAL_API_KEY)}
+    return {
+        "status": "ok",
+        "mistral_configured": bool(MISTRAL_API_KEY),
+        "turso_configured": bool(TURSO_DATABASE_URL),
+    }
 
 
 @app.get("/agents")

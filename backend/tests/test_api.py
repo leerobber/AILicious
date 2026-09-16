@@ -88,7 +88,10 @@ def client(tmp_path, monkeypatch):
 def test_health(client):
     resp = client.get("/health")
     assert resp.status_code == 200
-    assert resp.json()["status"] == "ok"
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["mistral_configured"] is True
+    assert body["turso_configured"] is False
 
 
 def test_agents_requires_api_key(client):
