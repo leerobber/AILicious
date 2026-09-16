@@ -172,6 +172,17 @@ Honest scope: this is a persisted event log, not a metrics/tracing system — no
 
 Tested the same way as everything else here: round-trip storage and filtering for the module itself (`test_events.py`), plus a specific assertion per real call site that the *right* event gets recorded for the *right* reason — a digest that actually applies, one that's coalesced away, one with no new turns, one that fails to parse; a profile merge that succeeds vs. fails; a SAGE evaluation that records its verdict, one that additionally reverts the override on `regressed` (and, deliberately, does *not* record a `reverted` event when the verdict isn't `regressed`); embedding storage succeeding vs. failing. Deliberate-break-confirmed on the SAGE `evaluated` event specifically: removing that `record_event` call correctly fails the test that checks for it, restored once confirmed.
 
+### Cost tracking
+
+Every one of this project's Mistral calls — a live chat turn, a digest cycle, the profile merge, a SAGE evaluation or analysis, an embedding — was previously invisible on the token/cost axis the same way the background cycles were invisible on the "did it run" axis before `core/events.py`. `core/cost.py` closes that gap with a `token_usage` table: each call's `prompt_tokens`/`completion_tokens`/`total_tokens` from Mistral's own `usage` field, tagged by `category` (`chat`/`digest`/`profile_merge`/`sage_evaluation`/`sage_analyze`/`embedding`), `model`, and optional `agent`.
+
+- `_call_mistral_raw` and `_embed_text` record usage right after a successful response, best-effort like `record_event` — a failure to log token counts must never break the call that produced them.
+- `GET /costs` (optional `category` filter) returns totals grouped by category and model, plus a grand total.
+
+Honest scope, deliberately: this stores and reports raw token counts only, never a dollar estimate. Per-token pricing varies by model and changes over time, and hardcoding a rate here means either it goes stale silently or this module has to track Mistral's price sheet — neither is this project's job. Multiply the returned counts by whatever your own current Mistral pricing is for an actual cost figure.
+
+Tested the same way as `core/events.py`: round-trip recording and aggregation (by category, by category+model, filtered) in `test_cost.py`, plus API-level tests confirming a real `/chat` call records against the `chat` category with the token counts Mistral actually reported. Deliberate-break-confirmed: removing the `record_usage` call in `_call_mistral_raw` correctly fails the test that checks for it, restored once confirmed.
+
 ### Run locally
 
 ```bash

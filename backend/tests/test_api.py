@@ -17,7 +17,10 @@ async def _fake_post(self, url, json=None, headers=None, **kwargs):
     sent_requests.append(json)
     return httpx.Response(
         200,
-        json={"choices": [{"message": {"content": mock_reply_content}}]},
+        json={
+            "choices": [{"message": {"content": mock_reply_content}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        },
         request=httpx.Request("POST", url),
     )
 
@@ -35,6 +38,7 @@ scheduled_embeddings: list[tuple[int, str]] = []
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
+    from core import cost as cost_module
     from core import digest as digest_module
     from core import events as events_module
     from core import memory as memory_module
@@ -49,6 +53,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(digest_module, "DB_PATH", db_path)
     monkeypatch.setattr(user_profile_module, "DB_PATH", db_path)
     monkeypatch.setattr(events_module, "DB_PATH", db_path)
+    monkeypatch.setattr(cost_module, "DB_PATH", db_path)
     digest_module._active_agents.clear()
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
     sent_requests.clear()
@@ -500,7 +505,7 @@ def test_sage_loop_reverts_override_when_evaluation_finds_regression(monkeypatch
         ]
     )
 
-    async def fake_call_mistral(messages):
+    async def fake_call_mistral(messages, **kwargs):
         return next(replies)
 
     monkeypatch.setattr(main_module, "_call_mistral", fake_call_mistral)
@@ -544,7 +549,7 @@ def test_sage_loop_leaves_override_in_place_when_evaluation_finds_improvement(mo
         ]
     )
 
-    async def fake_call_mistral(messages):
+    async def fake_call_mistral(messages, **kwargs):
         return next(replies)
 
     monkeypatch.setattr(main_module, "_call_mistral", fake_call_mistral)
@@ -814,7 +819,7 @@ def test_digest_cycle_merges_into_shared_profile(monkeypatch, tmp_path):
         ]
     )
 
-    async def fake_call_mistral(messages):
+    async def fake_call_mistral(messages, **kwargs):
         return next(replies)
 
     monkeypatch.setattr(main_module, "_call_mistral", fake_call_mistral)
@@ -1383,3 +1388,37 @@ def test_cross_agent_memory_does_not_leak(client):
     oracle_request = sent_requests[-1]
     oracle_messages_text = " ".join(m["content"] for m in oracle_request["messages"])
     assert "forge secret" not in oracle_messages_text
+
+
+def test_costs_requires_api_key(client):
+    resp = client.get("/costs")
+    assert resp.status_code == 401
+
+
+def test_costs_empty_by_default(client):
+    resp = client.get("/costs", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "by_category": [],
+        "totals": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0},
+    }
+
+
+def test_chat_records_token_usage_against_the_chat_category(client):
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hello"})
+    assert resp.status_code == 200
+
+    summary = client.get("/costs", headers={"X-API-Key": VALID_KEY}).json()
+    chat_rows = [row for row in summary["by_category"] if row["category"] == "chat"]
+    assert len(chat_rows) == 1
+    assert chat_rows[0]["prompt_tokens"] == 10
+    assert chat_rows[0]["completion_tokens"] == 5
+    assert chat_rows[0]["total_tokens"] == 15
+    assert chat_rows[0]["calls"] == 1
+
+
+def test_costs_filters_by_category(client):
+    client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hello"})
+
+    resp = client.get("/costs", headers={"X-API-Key": VALID_KEY}, params={"category": "digest"})
+    assert resp.json()["by_category"] == []
