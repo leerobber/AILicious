@@ -1588,6 +1588,70 @@ def test_stream_nexus_delegates_via_reassembled_tool_call_deltas(client, monkeyp
     assert any(m["content"] == "write a hello function" for m in forge_history)
 
 
+def test_stream_nexus_reads_github_via_reassembled_tool_call_deltas(client, monkeypatch):
+    import base64
+
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "GITHUB_PAT", "fake-github-pat")
+    monkeypatch.setattr(main_module, "GITHUB_ALLOWED_REPOS", {"leerobber/AILicious"})
+
+    tool_call_args = json.dumps({"repo": "leerobber/AILicious", "path": "README.md"})
+    round1_lines = [
+        "data: "
+        + json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "function": {"name": "read_github_file", "arguments": tool_call_args},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ),
+        "data: [DONE]",
+    ]
+    round2_lines = _sse_content_lines(["The README says: hello."])
+    stream_log: list[dict] = []
+
+    def sequenced_stream(self, method, url, json=None, headers=None, **kwargs):
+        stream_log.append(json)
+        lines = round1_lines if len(stream_log) == 1 else round2_lines
+        return _FakeStreamContext(_FakeStreamResponse(lines))
+
+    async def fake_get(self, url, headers=None, **kwargs):
+        return httpx.Response(
+            200,
+            json={"type": "file", "content": base64.b64encode(b"hello").decode()},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "stream", sequenced_stream)
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    with client.stream(
+        "POST",
+        "/agents/nexus/stream",
+        headers={"X-API-Key": VALID_KEY},
+        json={"message": "what does the README say?"},
+    ) as resp:
+        assert resp.status_code == 200
+        events = _parse_sse(resp.iter_lines())
+
+    deltas = "".join(e["delta"] for e in events if "delta" in e)
+    assert deltas == "The README says: hello."
+
+    done = next(e for e in events if e.get("done"))
+    assert done["read_from_github"] == ["leerobber/AILicious:README.md"]
+
+
 def test_stream_rejects_message_too_long_before_streaming(client):
     with client.stream(
         "POST",
@@ -1643,3 +1707,240 @@ def test_stream_does_not_record_token_usage(client):
 
     summary = client.get("/costs", headers={"X-API-Key": VALID_KEY}).json()
     assert summary["totals"]["calls"] == 0
+
+
+def test_github_read_tool_absent_by_default(client):
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+    assert resp.status_code == 200
+    tool_names = {t["function"]["name"] for t in sent_requests[-1]["tools"]}
+    assert "read_github_file" not in tool_names
+
+
+def test_github_read_tool_offered_when_configured(client, monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "GITHUB_PAT", "fake-github-pat")
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"})
+    assert resp.status_code == 200
+    tool_names = {t["function"]["name"] for t in sent_requests[-1]["tools"]}
+    assert "read_github_file" in tool_names
+
+
+def test_nexus_executes_real_github_read_and_records_location(client, monkeypatch):
+    import base64
+
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "GITHUB_PAT", "fake-github-pat")
+    monkeypatch.setattr(main_module, "GITHUB_ALLOWED_REPOS", {"leerobber/AILicious"})
+
+    tool_call_args = json.dumps({"repo": "leerobber/AILicious", "path": "README.md"})
+    file_content = "# AILicious\n\nSome real content."
+    call_log: list[dict] = []
+
+    async def sequenced_post(self, url, json=None, headers=None, **kwargs):
+        call_log.append(json)
+        if len(call_log) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "read_github_file", "arguments": tool_call_args},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "The README says: Some real content."}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    async def fake_get(self, url, headers=None, **kwargs):
+        assert "leerobber/AILicious" in str(url)
+        assert "README.md" in str(url)
+        return httpx.Response(
+            200,
+            json={"type": "file", "content": base64.b64encode(file_content.encode()).decode()},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", sequenced_post)
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "what does the README say?"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["read_from_github"] == ["leerobber/AILicious:README.md"]
+    assert body["response"] == "The README says: Some real content."
+    assert len(call_log) == 2  # NEXUS decides -> NEXUS synthesizes; the GitHub read itself is a GET
+
+
+def test_github_read_malformed_arguments_does_not_read(client, monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "GITHUB_PAT", "fake-github-pat")
+    call_log: list[dict] = []
+
+    async def sequenced_post(self, url, json=None, headers=None, **kwargs):
+        call_log.append(json)
+        if len(call_log) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "read_github_file", "arguments": "not valid json"},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "I couldn't read that file."}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    async def fake_get(self, url, headers=None, **kwargs):
+        raise AssertionError("should never call GitHub with a malformed tool call")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", sequenced_post)
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "read a file"})
+    assert resp.status_code == 200
+    assert resp.json()["read_from_github"] == []
+
+
+def test_execute_github_read_fails_without_configured_token(monkeypatch):
+    import asyncio
+
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "GITHUB_PAT", None)
+    call = {"function": {"arguments": json.dumps({"repo": "a/b", "path": "x"})}}
+
+    location, result = asyncio.run(main_module._execute_github_read(call))
+    assert location is None
+    assert "no GitHub token" in result
+
+
+def test_execute_github_read_rejects_repo_not_in_allowlist(monkeypatch):
+    import asyncio
+
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "GITHUB_PAT", "fake-pat")
+    monkeypatch.setattr(main_module, "GITHUB_ALLOWED_REPOS", {"leerobber/AILicious"})
+    call = {"function": {"arguments": json.dumps({"repo": "someone/else", "path": "x"})}}
+
+    location, result = asyncio.run(main_module._execute_github_read(call))
+    assert location == "someone/else:x"
+    assert "not in the server's allowed-repos list" in result
+
+
+def test_execute_github_read_rejects_a_directory(monkeypatch):
+    import asyncio
+
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "GITHUB_PAT", "fake-pat")
+    monkeypatch.setattr(main_module, "GITHUB_ALLOWED_REPOS", {"leerobber/AILicious"})
+
+    async def fake_get(self, url, headers=None, **kwargs):
+        return httpx.Response(200, json={"type": "dir"}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    call = {"function": {"arguments": json.dumps({"repo": "leerobber/AILicious", "path": "backend"})}}
+
+    location, result = asyncio.run(main_module._execute_github_read(call))
+    assert location == "leerobber/AILicious:backend"
+    assert "is not a file" in result
+
+
+def test_execute_github_read_handles_file_too_large_for_inline_content(monkeypatch):
+    import asyncio
+
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "GITHUB_PAT", "fake-pat")
+    monkeypatch.setattr(main_module, "GITHUB_ALLOWED_REPOS", {"leerobber/AILicious"})
+
+    async def fake_get(self, url, headers=None, **kwargs):
+        return httpx.Response(200, json={"type": "file"}, request=httpx.Request("GET", url))  # no "content" key
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    call = {"function": {"arguments": json.dumps({"repo": "leerobber/AILicious", "path": "big.bin"})}}
+
+    location, result = asyncio.run(main_module._execute_github_read(call))
+    assert "too large" in result
+
+
+def test_execute_github_read_truncates_long_file_content(monkeypatch):
+    import asyncio
+    import base64
+
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "GITHUB_PAT", "fake-pat")
+    monkeypatch.setattr(main_module, "GITHUB_ALLOWED_REPOS", {"leerobber/AILicious"})
+    monkeypatch.setattr(main_module, "GITHUB_MAX_FILE_CHARS", 10)
+
+    long_content = "x" * 100
+
+    async def fake_get(self, url, headers=None, **kwargs):
+        return httpx.Response(
+            200,
+            json={"type": "file", "content": base64.b64encode(long_content.encode()).decode()},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    call = {"function": {"arguments": json.dumps({"repo": "leerobber/AILicious", "path": "big.txt"})}}
+
+    location, result = asyncio.run(main_module._execute_github_read(call))
+    assert result.startswith("x" * 10)
+    assert "truncated" in result
+    assert len(result) < 100
+
+
+def test_execute_github_read_handles_api_error(monkeypatch):
+    import asyncio
+
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "GITHUB_PAT", "fake-pat")
+    monkeypatch.setattr(main_module, "GITHUB_ALLOWED_REPOS", {"leerobber/AILicious"})
+
+    async def fake_get(self, url, headers=None, **kwargs):
+        return httpx.Response(404, json={"message": "Not Found"}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    call = {"function": {"arguments": json.dumps({"repo": "leerobber/AILicious", "path": "nope.txt"})}}
+
+    location, result = asyncio.run(main_module._execute_github_read(call))
+    assert "404" in result

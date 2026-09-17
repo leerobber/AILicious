@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import functools
 import json
 import os
@@ -43,6 +44,13 @@ MISTRAL_EMBED_MODEL = os.environ.get("MISTRAL_EMBED_MODEL", "mistral-embed")
 APP_API_KEY = os.environ.get("APP_API_KEY")
 TAVILY_API_URL = "https://api.tavily.com/search"
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")  # optional: web search tool is omitted if unset
+GITHUB_API_URL = "https://api.github.com"
+GITHUB_PAT = os.environ.get("GITHUB_PAT")  # optional: read-only GitHub tool is omitted if unset
+# Defense in depth: even though the token itself should be a fine-grained PAT scoped to
+# specific repos, this allowlist is enforced here too, so a misconfigured or overly-broad
+# token still can't reach anything the operator didn't explicitly name.
+GITHUB_ALLOWED_REPOS = {r.strip() for r in os.environ.get("GITHUB_ALLOWED_REPOS", "").split(",") if r.strip()}
+GITHUB_MAX_FILE_CHARS = 20000  # keeps one file read from blowing out the context window
 RECENT_TAIL_LIMIT = 6  # short raw window; the conversation digest carries the rest
 SEMANTIC_RECALL_LIMIT = 4  # extra older messages surfaced by similarity, beyond the flat recency tail
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "20"))
@@ -80,6 +88,7 @@ class ChatResponse(BaseModel):
     message_id: int
     delegated_to: list[str] = []
     searched_web: list[str] = []
+    read_from_github: list[str] = []
 
 
 class FeedbackRequest(BaseModel):
@@ -402,10 +411,91 @@ async def _execute_web_search(call: dict) -> tuple[str | None, str]:
     return query, "\n\n---\n\n".join(blocks)
 
 
+def _github_read_tool_schema() -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": "read_github_file",
+            "description": (
+                "Read a file's contents from one of the user's own GitHub repositories, so "
+                "you can answer questions about their real code instead of guessing at it. "
+                "Only works for repositories the server has been explicitly configured to "
+                "allow -- if a repo isn't allowed, or the read fails for any reason, say so "
+                "plainly rather than inventing what the file might contain. Read-only: there "
+                "is no way to write, create, or modify anything in any repository."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "The repository in 'owner/name' form, e.g. 'leerobber/AILicious'.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file within the repository, e.g. 'backend/main.py'.",
+                    },
+                },
+                "required": ["repo", "path"],
+            },
+        },
+    }
+
+
+async def _execute_github_read(call: dict) -> tuple[str | None, str]:
+    """Runs one read_github_file tool call for real via the GitHub REST API. Never raises: a
+    failure (bad path, disallowed repo, API error) comes back as a tool result NEXUS can
+    react to, not an error that kills the whole turn. Deliberately read-only -- this only
+    ever sends a GET, there is no corresponding write tool, and none is planned.
+    """
+    try:
+        args = json.loads(call["function"]["arguments"])
+        repo = args["repo"]
+        path = args["path"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return None, f"GitHub read failed: malformed tool call ({exc})"
+
+    location = f"{repo}:{path}"
+
+    if not GITHUB_PAT:
+        return None, "GitHub read failed: no GitHub token is configured on the server."
+
+    if repo not in GITHUB_ALLOWED_REPOS:
+        return location, f"GitHub read failed: '{repo}' is not in the server's allowed-repos list."
+
+    url = f"{GITHUB_API_URL}/repos/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_PAT}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            return location, f"GitHub read failed: {exc.response.status_code} {exc.response.text[:300]}"
+        except httpx.RequestError as exc:
+            return location, f"GitHub read failed: {exc}"
+
+    data = resp.json()
+    if data.get("type") != "file":
+        return location, f"GitHub read failed: '{path}' in {repo} is not a file (it's a {data.get('type', 'directory')})."
+    if "content" not in data:
+        return location, f"GitHub read failed: '{path}' in {repo} is too large to read this way (over GitHub's 1MB inline limit)."
+
+    content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+    if len(content) > GITHUB_MAX_FILE_CHARS:
+        content = content[:GITHUB_MAX_FILE_CHARS] + "\n... (truncated)"
+    return location, content
+
+
 def _nexus_tools() -> list[dict]:
     tools = [_delegate_tool_schema()]
     if TAVILY_API_KEY:
         tools.append(_web_search_tool_schema())
+    if GITHUB_PAT:
+        tools.append(_github_read_tool_schema())
     return tools
 
 
@@ -428,7 +518,9 @@ def _looks_time_sensitive(message: str) -> bool:
     return any(keyword in lowered for keyword in _TIME_SENSITIVE_KEYWORDS)
 
 
-async def _execute_tool_calls(tool_calls: list[dict], session_id: str) -> tuple[list[dict], list[str], list[str]]:
+async def _execute_tool_calls(
+    tool_calls: list[dict], session_id: str
+) -> tuple[list[dict], list[str], list[str], list[str]]:
     """Executes each tool call for real and builds the resulting `tool`-role messages to
     append to the conversation. Shared between NEXUS's non-streamed and streamed
     tool-resolution loops, which differ only in how they get from Mistral to a tool_calls
@@ -438,6 +530,7 @@ async def _execute_tool_calls(tool_calls: list[dict], session_id: str) -> tuple[
     tool_messages: list[dict] = []
     delegated_to: list[str] = []
     searched_web: list[str] = []
+    read_from_github: list[str] = []
     for call in tool_calls:
         name = call["function"]["name"]
         if name == "delegate_to_agent":
@@ -448,16 +541,21 @@ async def _execute_tool_calls(tool_calls: list[dict], session_id: str) -> tuple[
             query, result_text = await _execute_web_search(call)
             if query:
                 searched_web.append(query)
+        elif name == "read_github_file":
+            location, result_text = await _execute_github_read(call)
+            if location:
+                read_from_github.append(location)
         else:
             result_text = f"Tool call failed: unknown tool '{name}'."
         tool_messages.append({"role": "tool", "tool_call_id": call["id"], "name": name, "content": result_text})
-    return tool_messages, delegated_to, searched_web
+    return tool_messages, delegated_to, searched_web, read_from_github
 
 
-async def _run_nexus_turn(messages: list[dict], session_id: str) -> tuple[str, list[str], list[str]]:
+async def _run_nexus_turn(messages: list[dict], session_id: str) -> tuple[str, list[str], list[str], list[str]]:
     conversation = list(messages)
     delegated_to: list[str] = []
     searched_web: list[str] = []
+    read_from_github: list[str] = []
 
     force_search = bool(TAVILY_API_KEY) and messages and _looks_time_sensitive(messages[-1]["content"])
 
@@ -470,17 +568,18 @@ async def _run_nexus_turn(messages: list[dict], session_id: str) -> tuple[str, l
         tool_calls = choice_message.get("tool_calls")
 
         if not tool_calls:
-            return choice_message.get("content") or "", delegated_to, searched_web
+            return choice_message.get("content") or "", delegated_to, searched_web, read_from_github
 
         conversation.append(choice_message)
-        tool_messages, new_delegated, new_searched = await _execute_tool_calls(tool_calls, session_id)
+        tool_messages, new_delegated, new_searched, new_github = await _execute_tool_calls(tool_calls, session_id)
         delegated_to.extend(new_delegated)
         searched_web.extend(new_searched)
+        read_from_github.extend(new_github)
         conversation.extend(tool_messages)
 
     # Ran out of tool-call rounds -- force a plain final answer without further tool access.
     final = await _call_mistral(conversation, agent="nexus")
-    return final, delegated_to, searched_web
+    return final, delegated_to, searched_web, read_from_github
 
 
 async def _stream_nexus_round(conversation: list[dict], tool_choice: str | dict):
@@ -521,11 +620,13 @@ async def _run_nexus_turn_stream(messages: list[dict], session_id: str):
     partial text to the caller by itself -- per _stream_nexus_round, a round is either a
     silent tool call or the final answer -- so only the round that actually settles on a
     plain-text reply ever produces ("delta", ...) events. Yields ("delta", text) for each
-    chunk of that final answer, then exactly one ("done", (full_text, delegated_to, searched_web)).
+    chunk of that final answer, then exactly one
+    ("done", (full_text, delegated_to, searched_web, read_from_github)).
     """
     conversation = list(messages)
     delegated_to: list[str] = []
     searched_web: list[str] = []
+    read_from_github: list[str] = []
     force_search = bool(TAVILY_API_KEY) and messages and _looks_time_sensitive(messages[-1]["content"])
 
     for round_num in range(MAX_TOOL_ROUNDS_PER_TURN):
@@ -542,13 +643,14 @@ async def _run_nexus_turn_stream(messages: list[dict], session_id: str):
                 tool_calls = value
 
         if tool_calls is None:
-            yield "done", ("".join(content_parts), delegated_to, searched_web)
+            yield "done", ("".join(content_parts), delegated_to, searched_web, read_from_github)
             return
 
         conversation.append({"role": "assistant", "content": None, "tool_calls": tool_calls})
-        tool_messages, new_delegated, new_searched = await _execute_tool_calls(tool_calls, session_id)
+        tool_messages, new_delegated, new_searched, new_github = await _execute_tool_calls(tool_calls, session_id)
         delegated_to.extend(new_delegated)
         searched_web.extend(new_searched)
+        read_from_github.extend(new_github)
         conversation.extend(tool_messages)
 
     # Ran out of tool-call rounds -- force a streamed final answer without further tool access.
@@ -559,7 +661,7 @@ async def _run_nexus_turn_stream(messages: list[dict], session_id: str):
         if delta_content:
             full_text += delta_content
             yield "delta", delta_content
-    yield "done", (full_text, delegated_to, searched_web)
+    yield "done", (full_text, delegated_to, searched_web, read_from_github)
 
 
 def _schedule_digest(agent: str) -> None:
@@ -659,9 +761,9 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
     messages, session_id = await _prepare_chat_messages(agent, message, session_id)
 
     if agent == "nexus":
-        reply, delegated_to, searched_web = await _run_nexus_turn(messages, session_id)
+        reply, delegated_to, searched_web, read_from_github = await _run_nexus_turn(messages, session_id)
     else:
-        reply, delegated_to, searched_web = await _call_mistral(messages, agent=agent), [], []
+        reply, delegated_to, searched_web, read_from_github = await _call_mistral(messages, agent=agent), [], [], []
 
     message_id = await _finalize_chat_turn(agent, session_id, message, reply, request_started_at)
 
@@ -672,6 +774,7 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
         message_id=message_id,
         delegated_to=delegated_to,
         searched_web=searched_web,
+        read_from_github=read_from_github,
     )
 
 
@@ -681,10 +784,10 @@ async def run_agent_chat_stream(agent: str, message: str, session_id: str | None
     Server-Sent Events as they arrive instead of waiting for the whole thing. Each frame is
     `data: {...}\\n\\n` -- either `{"delta": "<text>"}` per chunk of generated text, or,
     exactly once at the end, `{"done": true, "session_id", "message_id", "delegated_to",
-    "searched_web"}` carrying the same metadata run_agent_chat returns in its response
-    body. A Mistral failure becomes a `{"error": "<detail>"}` frame instead of an HTTP
-    error status -- the response already committed to 200 by the time any bytes went out --
-    and, matching the non-streaming path, nothing gets stored when that happens.
+    "searched_web", "read_from_github"}` carrying the same metadata run_agent_chat returns
+    in its response body. A Mistral failure becomes a `{"error": "<detail>"}` frame instead
+    of an HTTP error status -- the response already committed to 200 by the time any bytes
+    went out -- and, matching the non-streaming path, nothing gets stored when that happens.
     """
     request_started_at = datetime.now(timezone.utc).isoformat()
     messages, session_id = await _prepare_chat_messages(agent, message, session_id)
@@ -692,6 +795,7 @@ async def run_agent_chat_stream(agent: str, message: str, session_id: str | None
     full_text = ""
     delegated_to: list[str] = []
     searched_web: list[str] = []
+    read_from_github: list[str] = []
 
     try:
         if agent == "nexus":
@@ -699,7 +803,7 @@ async def run_agent_chat_stream(agent: str, message: str, session_id: str | None
                 if kind == "delta":
                     yield _sse({"delta": value})
                 else:
-                    full_text, delegated_to, searched_web = value
+                    full_text, delegated_to, searched_web, read_from_github = value
         else:
             async for chunk in _stream_mistral_chunks(messages, category="chat", agent=agent):
                 choices = chunk.get("choices") or []
@@ -719,6 +823,7 @@ async def run_agent_chat_stream(agent: str, message: str, session_id: str | None
             "message_id": message_id,
             "delegated_to": delegated_to,
             "searched_web": searched_web,
+            "read_from_github": read_from_github,
         }
     )
 

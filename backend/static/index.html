@@ -657,13 +657,15 @@
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>';
     const DELEGATE_SVG =
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 10 20 15 15 20"></polyline><path d="M4 4v7a4 4 0 0 0 4 4h12"></path></svg>';
+    const GITHUB_SVG =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path></svg>';
 
     // Ground-truth badges: what the backend actually did this turn (real delegation, real
-    // search), shown independent of whether the model's own prose happened to mention it --
-    // NEXUS deciding not to call a tool it had, or wording a delegation ambiguously, shouldn't
-    // be the only way this is visible.
-    function createMetaBadges(delegatedTo, searchedWeb) {
-      if (!delegatedTo?.length && !searchedWeb?.length) return null;
+    // search, real GitHub read), shown independent of whether the model's own prose happened
+    // to mention it -- NEXUS deciding not to call a tool it had, or wording a delegation
+    // ambiguously, shouldn't be the only way this is visible.
+    function createMetaBadges(delegatedTo, searchedWeb, readFromGithub) {
+      if (!delegatedTo?.length && !searchedWeb?.length && !readFromGithub?.length) return null;
 
       const row = document.createElement("div");
       row.className = "meta-badges";
@@ -680,6 +682,20 @@
         badge.className = "meta-badge";
         badge.title = `Searched the web: ${query}`;
         badge.innerHTML = `${SEARCH_SVG}<span class="meta-badge-label">${query}</span>`;
+        row.appendChild(badge);
+      }
+      // repo:path comes from Mistral's own tool-call arguments, not a fixed enum like agent
+      // names are -- built via textContent rather than the innerHTML template literal the
+      // other two badges use, so it can't inject markup into the page.
+      for (const location of readFromGithub || []) {
+        const badge = document.createElement("span");
+        badge.className = "meta-badge";
+        badge.title = `Read from GitHub: ${location}`;
+        badge.innerHTML = GITHUB_SVG;
+        const label = document.createElement("span");
+        label.className = "meta-badge-label";
+        label.textContent = location;
+        badge.appendChild(label);
         row.appendChild(badge);
       }
       return row;
@@ -762,7 +778,7 @@
         bubble.textContent = content;
         col.appendChild(bubble);
 
-        const badges = createMetaBadges(meta.delegatedTo, meta.searchedWeb);
+        const badges = createMetaBadges(meta.delegatedTo, meta.searchedWeb, meta.readFromGithub);
         if (badges) col.appendChild(badges);
 
         if (meta.messageId) {
@@ -803,6 +819,7 @@
           feedback: turn.feedback,
           delegatedTo: turn.delegated_to,
           searchedWeb: turn.searched_web,
+          readFromGithub: turn.read_from_github,
         });
       }
       scrollToBottom();
@@ -1411,7 +1428,7 @@
         pending.classList.remove("pending");
         pending.textContent = fullText;
 
-        const badges = createMetaBadges(finalEvent.delegated_to, finalEvent.searched_web);
+        const badges = createMetaBadges(finalEvent.delegated_to, finalEvent.searched_web, finalEvent.read_from_github);
         if (badges) pending.parentElement.appendChild(badges);
         pending.parentElement.appendChild(createFeedbackRow(finalEvent.message_id, null));
 
@@ -1423,6 +1440,7 @@
           feedback: null,
           delegated_to: finalEvent.delegated_to || [],
           searched_web: finalEvent.searched_web || [],
+          read_from_github: finalEvent.read_from_github || [],
         });
         setHistory(agent, updatedHistory);
       } catch (err) {
