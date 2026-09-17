@@ -181,6 +181,8 @@ Every one of this project's Mistral calls — a live chat turn, a digest cycle, 
 
 Honest scope, deliberately: this stores and reports raw token counts only, never a dollar estimate. Per-token pricing varies by model and changes over time, and hardcoding a rate here means either it goes stale silently or this module has to track Mistral's price sheet — neither is this project's job. Multiply the returned counts by whatever your own current Mistral pricing is for an actual cost figure.
 
+Surfaced in the PWA, not just the API: both `GET /events` and `GET /costs` were API-only until now — real, but invisible unless you curled the backend yourself. A **Usage** panel (Settings → Usage) shows the same token-by-category breakdown and recent background activity `/events` and `/costs` already exposed, rendered where you'd actually look for it. Deliberately not scoped to the currently selected agent, same reasoning as the cross-agent profile view: it's a system-wide read on what's actually happening, not a per-agent stat.
+
 Tested the same way as `core/events.py`: round-trip recording and aggregation (by category, by category+model, filtered) in `test_cost.py`, plus API-level tests confirming a real `/chat` call records against the `chat` category with the token counts Mistral actually reported. Deliberate-break-confirmed: removing the `record_usage` call in `_call_mistral_raw` correctly fails the test that checks for it, restored once confirmed.
 
 ### Run locally

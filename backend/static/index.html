@@ -318,7 +318,7 @@
   button#send:active:not(:disabled) { transform: scale(0.92); }
   button#send:disabled { opacity: 0.4; cursor: default; }
 
-  dialog#settings, dialog#sage {
+  dialog#settings, dialog#sage, dialog#usage {
     background: #141c33;
     color: var(--text);
     border: 1px solid var(--border);
@@ -328,10 +328,10 @@
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
   }
   dialog#settings { max-width: 360px; }
-  dialog#sage { max-width: 440px; max-height: calc(100% - 64px); overflow-y: auto; }
-  dialog#settings::backdrop, dialog#sage::backdrop { background: rgba(4, 8, 20, 0.7); backdrop-filter: blur(2px); }
-  dialog#settings h2, dialog#sage h2 { margin-top: 0; font-size: 17px; }
-  dialog#settings label, dialog#sage label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 6px; }
+  dialog#sage, dialog#usage { max-width: 440px; max-height: calc(100% - 64px); overflow-y: auto; }
+  dialog#settings::backdrop, dialog#sage::backdrop, dialog#usage::backdrop { background: rgba(4, 8, 20, 0.7); backdrop-filter: blur(2px); }
+  dialog#settings h2, dialog#sage h2, dialog#usage h2 { margin-top: 0; font-size: 17px; }
+  dialog#settings label, dialog#sage label, dialog#usage label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 6px; }
   .profile-preview {
     font-size: 13px;
     color: var(--text-dim);
@@ -357,8 +357,8 @@
     transition: border-color 0.15s ease;
   }
   dialog#settings input[type="password"]:focus { outline: none; border-color: var(--accent); }
-  dialog#settings .row, dialog#sage .row { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
-  dialog#settings button, dialog#sage button {
+  dialog#settings .row, dialog#sage .row, dialog#usage .row { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+  dialog#settings button, dialog#sage button, dialog#usage button {
     border: none;
     border-radius: 10px;
     padding: 9px 15px;
@@ -366,13 +366,50 @@
     cursor: pointer;
     transition: filter 0.15s ease, transform 0.1s ease;
   }
-  dialog#settings button:active, dialog#sage button:active { transform: scale(0.96); }
+  dialog#settings button:active, dialog#sage button:active, dialog#usage button:active { transform: scale(0.96); }
   dialog#settings button.save, dialog#sage button.save { background: var(--accent); color: #04263a; font-weight: 600; }
   dialog#settings button.save:hover, dialog#sage button.save:hover { filter: brightness(1.08); }
   dialog#settings button.danger, dialog#sage button.danger { background: transparent; color: var(--error); }
   dialog#settings button.danger:hover, dialog#sage button.danger:hover { background: rgba(251, 113, 133, 0.1); }
-  dialog#settings button.cancel, dialog#sage button.cancel { background: var(--panel-2); color: var(--text); }
-  dialog#settings button.cancel:hover, dialog#sage button.cancel:hover { filter: brightness(1.2); }
+  dialog#settings button.cancel, dialog#sage button.cancel, dialog#usage button.cancel { background: var(--panel-2); color: var(--text); }
+  dialog#settings button.cancel:hover, dialog#sage button.cancel:hover, dialog#usage button.cancel:hover { filter: brightness(1.2); }
+
+  .usage-totals {
+    font-size: 13px;
+    color: var(--text);
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    line-height: 1.6;
+  }
+  .usage-category-list { display: flex; flex-direction: column; gap: 8px; }
+  .usage-category-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 12px;
+    font-size: 13px;
+  }
+  .usage-cat-name { font-weight: 600; text-transform: capitalize; white-space: nowrap; }
+  .usage-cat-model { color: var(--text-dim); font-weight: 400; text-transform: none; }
+  .usage-cat-tokens { color: var(--text-dim); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  .event-item {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 12px;
+    font-size: 13px;
+  }
+  .event-item .event-title { font-weight: 600; }
+  .event-item .event-title .event-agent { font-weight: 400; color: var(--text-dim); text-transform: none; }
+  .event-item .event-detail { color: var(--text-dim); margin-top: 2px; }
+  .event-item .event-time { color: var(--text-dim); font-size: 11px; margin-top: 4px; }
 
   #sage-analyze { width: 100%; margin-bottom: 4px; }
   .sage-section { margin-bottom: 14px; }
@@ -481,6 +518,7 @@
     <label>What AILicious knows about you (shared across every agent)</label>
     <div class="profile-preview" id="profile-preview">—</div>
     <div class="row">
+      <button type="button" class="cancel" id="open-usage">Usage</button>
       <button type="button" class="cancel" id="open-sage">Persona (SAGE)</button>
       <button type="button" class="danger" id="clear-history">Clear this agent's chat</button>
     </div>
@@ -508,6 +546,22 @@
     </div>
     <div class="row" style="margin-top: 12px;">
       <button type="button" class="cancel" id="sage-close">Close</button>
+    </div>
+  </dialog>
+
+  <dialog id="usage">
+    <h2>Usage</h2>
+    <div class="sage-section">
+      <label>Mistral token usage, by category</label>
+      <div id="usage-totals" class="usage-totals">—</div>
+      <div id="usage-categories" class="usage-category-list"></div>
+    </div>
+    <div class="sage-section">
+      <label>Recent background activity — every agent</label>
+      <div id="usage-events" class="history-list"></div>
+    </div>
+    <div class="row" style="margin-top: 12px;">
+      <button type="button" class="cancel" id="usage-close">Close</button>
     </div>
   </dialog>
 
@@ -547,6 +601,12 @@
     const sageProposalsEl = document.getElementById("sage-proposals");
     const sageHistoryEl = document.getElementById("sage-history");
     const sageResetBtn = document.getElementById("sage-reset");
+    const openUsageBtn = document.getElementById("open-usage");
+    const usageDialog = document.getElementById("usage");
+    const usageCloseBtn = document.getElementById("usage-close");
+    const usageTotalsEl = document.getElementById("usage-totals");
+    const usageCategoriesEl = document.getElementById("usage-categories");
+    const usageEventsEl = document.getElementById("usage-events");
 
     function storageKey(agent, suffix) {
       return `ailicious_${suffix}_${agent}`;
@@ -1111,6 +1171,118 @@
         sageResetBtn.disabled = false;
       }
     });
+
+    function formatTokens(n) {
+      return n.toLocaleString();
+    }
+
+    function renderUsageTotals(totals) {
+      usageTotalsEl.textContent =
+        `${formatTokens(totals.total_tokens)} tokens total ` +
+        `(${formatTokens(totals.prompt_tokens)} in / ${formatTokens(totals.completion_tokens)} out) ` +
+        `across ${formatTokens(totals.calls)} call${totals.calls === 1 ? "" : "s"}.`;
+    }
+
+    function renderUsageCategories(byCategory) {
+      usageCategoriesEl.innerHTML = "";
+      if (!byCategory.length) {
+        usageCategoriesEl.innerHTML = '<div class="no-proposals">No Mistral calls recorded yet.</div>';
+        return;
+      }
+      for (const row of byCategory) {
+        const item = document.createElement("div");
+        item.className = "usage-category-item";
+
+        const name = document.createElement("span");
+        name.className = "usage-cat-name";
+        name.textContent = `${row.category.replace(/_/g, " ")} `;
+        const model = document.createElement("span");
+        model.className = "usage-cat-model";
+        model.textContent = row.model;
+        name.appendChild(model);
+
+        const tokens = document.createElement("span");
+        tokens.className = "usage-cat-tokens";
+        tokens.textContent = `${formatTokens(row.total_tokens)} tok · ${formatTokens(row.calls)} call${row.calls === 1 ? "" : "s"}`;
+
+        item.append(name, tokens);
+        usageCategoriesEl.appendChild(item);
+      }
+    }
+
+    // Deliberately not agent-scoped -- unlike SAGE, which only makes sense per agent, this
+    // is a system-wide view of what's actually happening across every agent's background
+    // cycles, same rationale as the cross-agent user profile.
+    function renderUsageEvents(events) {
+      usageEventsEl.innerHTML = "";
+      if (!events.length) {
+        usageEventsEl.innerHTML = '<div class="no-proposals">Nothing recorded yet.</div>';
+        return;
+      }
+      for (const event of events) {
+        const item = document.createElement("div");
+        item.className = "event-item";
+
+        const title = document.createElement("div");
+        title.className = "event-title";
+        title.textContent = `${event.category} — ${event.event}`;
+        if (event.agent) {
+          const agentSpan = document.createElement("span");
+          agentSpan.className = "event-agent";
+          agentSpan.textContent = ` (${event.agent})`;
+          title.appendChild(agentSpan);
+        }
+        item.appendChild(title);
+
+        if (event.detail) {
+          const detail = document.createElement("div");
+          detail.className = "event-detail";
+          detail.textContent = event.detail;
+          item.appendChild(detail);
+        }
+
+        const time = document.createElement("div");
+        time.className = "event-time";
+        time.textContent = new Date(event.created_at).toLocaleString();
+        item.appendChild(time);
+
+        usageEventsEl.appendChild(item);
+      }
+    }
+
+    async function loadUsage() {
+      usageTotalsEl.textContent = "Loading…";
+      usageCategoriesEl.innerHTML = "";
+      usageEventsEl.innerHTML = "";
+      const key = getApiKey();
+      try {
+        const [costsResp, eventsResp] = await Promise.all([
+          fetch(`${API_BASE}/costs`, { headers: { "X-API-Key": key } }),
+          fetch(`${API_BASE}/events`, { headers: { "X-API-Key": key } }),
+        ]);
+        if (!costsResp.ok) throw new Error(`costs request failed (${costsResp.status})`);
+        if (!eventsResp.ok) throw new Error(`events request failed (${eventsResp.status})`);
+        const costs = await costsResp.json();
+        const events = await eventsResp.json();
+        renderUsageTotals(costs.totals);
+        renderUsageCategories(costs.by_category);
+        renderUsageEvents(events.events);
+      } catch (err) {
+        usageTotalsEl.textContent = `Couldn't load: ${err.message}`;
+      }
+    }
+
+    openUsageBtn.addEventListener("click", () => {
+      if (!getApiKey()) {
+        setKeyStatus("Save an API key first.", "var(--error)");
+        return;
+      }
+      settingsDialog.close();
+      usageDialog.showModal();
+      loadUsage();
+    });
+
+    usageCloseBtn.addEventListener("click", () => usageDialog.close());
 
     // auto-grow textarea up to CSS max-height
     inputEl.addEventListener("input", () => {
