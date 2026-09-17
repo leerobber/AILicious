@@ -3,6 +3,7 @@ import threading
 from datetime import datetime, timezone
 
 from core.db import DB_PATH, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL
+from core.db import execute_with_retry
 from core.db import get_connection as _db_get_connection
 
 _lock = threading.Lock()
@@ -60,18 +61,17 @@ def init_db() -> None:
 
 
 def add_message(session_id: str, agent: str, role: str, content: str) -> int:
+    def _insert(conn):
+        cursor = conn.execute(
+            "INSERT INTO messages (session_id, agent, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+            (session_id, agent, role, content, datetime.now(timezone.utc).isoformat()),
+        )
+        message_id = cursor.lastrowid
+        conn.commit()
+        return message_id
+
     with _lock:
-        conn = _get_connection()
-        try:
-            cursor = conn.execute(
-                "INSERT INTO messages (session_id, agent, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-                (session_id, agent, role, content, datetime.now(timezone.utc).isoformat()),
-            )
-            message_id = cursor.lastrowid
-            conn.commit()
-        finally:
-            conn.close()
-    return message_id
+        return execute_with_retry(_get_connection, _insert)
 
 
 def set_feedback(message_id: int, rating: int) -> bool:
@@ -82,17 +82,16 @@ def set_feedback(message_id: int, rating: int) -> bool:
     message is folded into the next digest cycle as extra-weighted signal. Returns
     False if no message with that id exists.
     """
+    def _update(conn):
+        row = conn.execute("SELECT id FROM messages WHERE id = ?", (message_id,)).fetchone()
+        if row is None:
+            return False
+        conn.execute("UPDATE messages SET feedback = ? WHERE id = ?", (rating, message_id))
+        conn.commit()
+        return True
+
     with _lock:
-        conn = _get_connection()
-        try:
-            row = conn.execute("SELECT id FROM messages WHERE id = ?", (message_id,)).fetchone()
-            if row is None:
-                return False
-            conn.execute("UPDATE messages SET feedback = ? WHERE id = ?", (rating, message_id))
-            conn.commit()
-        finally:
-            conn.close()
-    return True
+        return execute_with_retry(_get_connection, _update)
 
 
 def get_history(session_id: str, agent: str, limit: int = 20) -> list[dict]:
@@ -156,13 +155,14 @@ def get_recent_message_ids(session_id: str, agent: str, limit: int) -> set[int]:
 
 
 def set_embedding(message_id: int, embedding: list[float]) -> None:
+    payload = json.dumps(embedding)
+
+    def _update(conn):
+        conn.execute("UPDATE messages SET embedding = ? WHERE id = ?", (payload, message_id))
+        conn.commit()
+
     with _lock:
-        conn = _get_connection()
-        try:
-            conn.execute("UPDATE messages SET embedding = ? WHERE id = ?", (json.dumps(embedding), message_id))
-            conn.commit()
-        finally:
-            conn.close()
+        execute_with_retry(_get_connection, _update)
 
 
 def get_embedded_messages(agent: str, exclude_ids: set[int]) -> list[dict]:

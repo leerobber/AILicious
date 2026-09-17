@@ -209,3 +209,64 @@ def test_init_db_is_idempotent_against_pre_agent_column_schema(tmp_path, monkeyp
 
     history = memory_module.get_history("legacy-session", "nexus")
     assert history == [{"role": "user", "content": "legacy row"}]
+
+
+def _flaky_once(real_get_connection):
+    """Returns a `_get_connection` replacement that fails with Turso's exact observed
+    "retry the transaction" error on its first call, then delegates to the real one --
+    reproducing the production failure (an idle interactive transaction rolled back
+    under load) without needing a real Turso connection.
+    """
+    calls = {"n": 0}
+
+    class _FlakyConnection:
+        def execute(self, *args, **kwargs):
+            raise ValueError(
+                'Hrana: `stream error: `Error { message: "SQLite error: interactive transaction was '
+                'rolled back because the stream was idle for too long; retry the transaction", '
+                'code: "SQLITE_BUSY" }`'
+            )
+
+        def close(self):
+            pass
+
+    def _get_connection():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _FlakyConnection()
+        return real_get_connection()
+
+    return _get_connection, calls
+
+
+def test_add_message_retries_transient_turso_error_and_succeeds(monkeypatch):
+    fake_get_connection, calls = _flaky_once(memory_module._get_connection)
+    monkeypatch.setattr(memory_module, "_get_connection", fake_get_connection)
+
+    message_id = memory_module.add_message("s1", "nexus", "user", "hi")  # must not raise
+
+    assert isinstance(message_id, int)
+    assert calls["n"] == 2  # one failed attempt, one real retry
+
+
+def test_set_feedback_retries_transient_turso_error_and_succeeds(monkeypatch):
+    message_id = memory_module.add_message("s1", "nexus", "assistant", "reply")
+
+    fake_get_connection, calls = _flaky_once(memory_module._get_connection)
+    monkeypatch.setattr(memory_module, "_get_connection", fake_get_connection)
+
+    assert memory_module.set_feedback(message_id, 1) is True
+    assert calls["n"] == 2
+
+
+def test_set_embedding_retries_transient_turso_error_and_succeeds(monkeypatch):
+    message_id = memory_module.add_message("s1", "nexus", "user", "hi")
+
+    fake_get_connection, calls = _flaky_once(memory_module._get_connection)
+    monkeypatch.setattr(memory_module, "_get_connection", fake_get_connection)
+
+    memory_module.set_embedding(message_id, [1.0, 2.0, 3.0])  # must not raise
+    assert calls["n"] == 2
+
+    stored = memory_module.get_embedded_messages("nexus", exclude_ids=set())
+    assert any(m["id"] == message_id and m["embedding"] == [1.0, 2.0, 3.0] for m in stored)
