@@ -1414,6 +1414,105 @@ def test_nexus_second_round_tool_choice_reverts_to_auto_after_forced_search(clie
     assert mistral_calls[1]["tool_choice"] == "auto"
 
 
+def test_looks_like_github_request_matches_common_phrasings():
+    from main import _looks_like_github_request
+
+    assert _looks_like_github_request("read the readme from my github repo") is True
+    assert _looks_like_github_request("what's in leerobber/FactoryX") is False  # no keyword -- heuristic is simple
+    assert _looks_like_github_request("check my repo for that file") is True
+    assert _looks_like_github_request("write me a python function to reverse a list") is False
+    assert _looks_like_github_request("hello") is False
+
+
+def test_nexus_forces_github_tool_choice_for_github_looking_message(client, monkeypatch):
+    """Live-tested bug, same shape as the search_web one above: tool_choice="auto" left
+    entirely up to Mistral was unreliable for read_github_file too -- of 4 identical live
+    requests against the deployed app, only 1 actually called the tool. Same fix, same test
+    shape: force the specific tool on round 1 for a message that looks like it's asking
+    about a repo."""
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "GITHUB_PAT", "fake-github-pat")
+
+    resp = client.post(
+        "/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "read the readme from my github repo"}
+    )
+    assert resp.status_code == 200
+    assert sent_requests[-1]["tool_choice"] == {"type": "function", "function": {"name": "read_github_file"}}
+
+
+def test_nexus_does_not_force_github_tool_choice_for_unrelated_message(client, monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "GITHUB_PAT", "fake-github-pat")
+
+    resp = client.post("/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "hello"})
+    assert resp.status_code == 200
+    assert sent_requests[-1]["tool_choice"] == "auto"
+
+
+def test_nexus_does_not_force_github_tool_choice_without_github_pat(client):
+    resp = client.post(
+        "/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "read the readme from my github repo"}
+    )
+    assert resp.status_code == 200
+    assert sent_requests[-1]["tool_choice"] == "auto"
+
+
+def test_nexus_second_round_tool_choice_reverts_to_auto_after_forced_github_read(client, monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "GITHUB_PAT", "fake-github-pat")
+    monkeypatch.setattr(main_module, "GITHUB_ALLOWED_REPOS", {"leerobber/AILicious"})
+
+    tool_call_args = json.dumps({"repo": "leerobber/AILicious", "path": "README.md"})
+    call_log: list[dict] = []
+
+    async def sequenced_post(self, url, json=None, headers=None, **kwargs):
+        call_log.append(json)
+        if len([c for c in call_log if "model" in c]) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "read_github_file", "arguments": tool_call_args},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "here's what the readme says"}}]}, request=httpx.Request("POST", url)
+        )
+
+    async def fake_get(self, url, headers=None, **kwargs):
+        raise httpx.RequestError("simulated network failure", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", sequenced_post)
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    resp = client.post(
+        "/chat", headers={"X-API-Key": VALID_KEY}, json={"message": "read my github readme"}
+    )
+    assert resp.status_code == 200
+
+    mistral_calls = [c for c in call_log if "model" in c]
+    assert len(mistral_calls) == 2
+    assert mistral_calls[0]["tool_choice"] == {"type": "function", "function": {"name": "read_github_file"}}
+    assert mistral_calls[1]["tool_choice"] == "auto"
+
+
 def test_cross_agent_memory_does_not_leak(client):
     forge_resp = client.post("/agents/forge", headers={"X-API-Key": VALID_KEY}, json={"message": "forge secret"})
     session_id = forge_resp.json()["session_id"]
