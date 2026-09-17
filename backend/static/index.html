@@ -1297,6 +1297,48 @@
       }
     });
 
+    // Reads a `/agents/{agent}/stream` response's SSE body: `data: {...}\n\n` frames, each
+    // either `{"delta": "<text>"}` or, exactly once at the end, `{"done": true, ...}` or
+    // `{"error": "<detail>"}`. `onDelta` is called with the accumulated text so far after
+    // every delta, so the caller can render growing text live instead of waiting for the
+    // whole reply.
+    async function consumeChatStream(resp, onDelta) {
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let fullText = "";
+      let finalEvent = null;
+      let streamError = null;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop();
+        for (const frame of frames) {
+          if (!frame.startsWith("data:")) continue;
+          let evt;
+          try {
+            evt = JSON.parse(frame.slice(5).trim());
+          } catch {
+            continue;
+          }
+          if (evt.error) {
+            streamError = evt.error;
+          } else if (evt.delta) {
+            fullText += evt.delta;
+            onDelta(fullText);
+          } else if (evt.done) {
+            finalEvent = evt;
+          }
+        }
+        if (streamError) break;
+      }
+
+      return { fullText, finalEvent, streamError };
+    }
+
     composerForm.addEventListener("submit", async (e) => {
       e.preventDefault();
       const message = inputEl.value.trim();
@@ -1324,7 +1366,7 @@
       scrollToBottom();
 
       try {
-        const resp = await fetch(`${API_BASE}/agents/${agent}`, {
+        const resp = await fetch(`${API_BASE}/agents/${agent}/stream`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -1333,31 +1375,54 @@
           body: JSON.stringify({ message, session_id: getSessionId(agent) }),
         });
 
-        const data = await resp.json();
-
         if (!resp.ok) {
+          // A rejection at this point (bad key, message too long, unknown agent, rate
+          // limit) happens before the stream ever starts, so it's still a normal JSON
+          // error body -- not an SSE frame.
+          let detail;
+          try {
+            detail = (await resp.json()).detail;
+          } catch {
+            /* non-JSON error body -- fall through to the generic message below */
+          }
           pending.closest(".msg-row").remove();
-          renderMessage("error", data.detail || `Request failed (${resp.status})`);
-          scrollToBottom();
+          renderMessage("error", detail || `Request failed (${resp.status})`);
           return;
         }
 
-        setSessionId(agent, data.session_id);
-        pending.classList.remove("pending");
-        pending.textContent = data.response;
+        const { fullText, finalEvent, streamError } = await consumeChatStream(resp, (partialText) => {
+          pending.classList.remove("pending");
+          pending.textContent = partialText;
+          scrollToBottom();
+        });
 
-        const badges = createMetaBadges(data.delegated_to, data.searched_web);
+        if (streamError) {
+          pending.closest(".msg-row").remove();
+          renderMessage("error", streamError);
+          return;
+        }
+        if (!finalEvent) {
+          pending.closest(".msg-row").remove();
+          renderMessage("error", "Stream ended unexpectedly.");
+          return;
+        }
+
+        setSessionId(agent, finalEvent.session_id);
+        pending.classList.remove("pending");
+        pending.textContent = fullText;
+
+        const badges = createMetaBadges(finalEvent.delegated_to, finalEvent.searched_web);
         if (badges) pending.parentElement.appendChild(badges);
-        pending.parentElement.appendChild(createFeedbackRow(data.message_id, null));
+        pending.parentElement.appendChild(createFeedbackRow(finalEvent.message_id, null));
 
         const updatedHistory = getHistory(agent);
         updatedHistory.push({
           role: "assistant",
-          content: data.response,
-          message_id: data.message_id,
+          content: fullText,
+          message_id: finalEvent.message_id,
           feedback: null,
-          delegated_to: data.delegated_to || [],
-          searched_web: data.searched_web || [],
+          delegated_to: finalEvent.delegated_to || [],
+          searched_web: finalEvent.searched_web || [],
         });
         setHistory(agent, updatedHistory);
       } catch (err) {
