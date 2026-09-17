@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -149,6 +150,71 @@ async def _call_mistral_raw(
 async def _call_mistral(messages: list[dict], category: str = "chat", agent: str | None = None) -> str:
     data = await _call_mistral_raw(messages, category=category, agent=agent)
     return data["choices"][0]["message"]["content"]
+
+
+def _sse(payload: dict) -> bytes:
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+async def _stream_mistral_chunks(
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    tool_choice: str | dict = "auto",
+    category: str = "chat",
+    agent: str | None = None,
+):
+    """Streams one Mistral chat completion, yielding each parsed SSE chunk dict as it
+    arrives (the standard OpenAI-compatible `chat.completion.chunk` shape Mistral's API
+    advertises support for). Unlike _call_mistral_raw, this does NOT request
+    `stream_options.include_usage` -- that's an unverified assumption this project hasn't
+    tested against the live Mistral API, and getting it wrong risks breaking every
+    streamed reply rather than just losing a cost-tracking data point. Concretely: streamed
+    replies aren't recorded in core.cost right now (see README's Cost tracking section).
+    """
+    if not MISTRAL_API_KEY:
+        raise HTTPException(status_code=500, detail="MISTRAL_API_KEY is not configured on the server")
+
+    payload = {"model": MISTRAL_MODEL, "messages": messages, "stream": True}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice
+    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream("POST", MISTRAL_API_URL, json=payload, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Mistral API error: {resp.status_code} {body.decode(errors='replace')}",
+                    )
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[len("data:") :].strip()
+                    if raw == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    # Best-effort, same as _call_mistral_raw: only recorded if a chunk
+                    # actually carries it, never assumed or requested.
+                    usage = chunk.get("usage")
+                    if usage:
+                        await asyncio.to_thread(
+                            record_usage,
+                            category,
+                            chunk.get("model", MISTRAL_MODEL),
+                            usage.get("prompt_tokens", 0),
+                            usage.get("completion_tokens", 0),
+                            usage.get("total_tokens", 0),
+                            agent,
+                        )
+                    yield chunk
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to reach Mistral API: {exc}") from exc
 
 
 async def _embed_text(text: str) -> list[float] | None:
@@ -362,6 +428,32 @@ def _looks_time_sensitive(message: str) -> bool:
     return any(keyword in lowered for keyword in _TIME_SENSITIVE_KEYWORDS)
 
 
+async def _execute_tool_calls(tool_calls: list[dict], session_id: str) -> tuple[list[dict], list[str], list[str]]:
+    """Executes each tool call for real and builds the resulting `tool`-role messages to
+    append to the conversation. Shared between NEXUS's non-streamed and streamed
+    tool-resolution loops, which differ only in how they get from Mistral to a tool_calls
+    list (a plain field on the message vs. reassembled from streamed deltas) -- dispatch
+    and message-shape from that point on is identical either way.
+    """
+    tool_messages: list[dict] = []
+    delegated_to: list[str] = []
+    searched_web: list[str] = []
+    for call in tool_calls:
+        name = call["function"]["name"]
+        if name == "delegate_to_agent":
+            agent_name, result_text = await _execute_delegation(call, session_id)
+            if agent_name:
+                delegated_to.append(agent_name)
+        elif name == "search_web":
+            query, result_text = await _execute_web_search(call)
+            if query:
+                searched_web.append(query)
+        else:
+            result_text = f"Tool call failed: unknown tool '{name}'."
+        tool_messages.append({"role": "tool", "tool_call_id": call["id"], "name": name, "content": result_text})
+    return tool_messages, delegated_to, searched_web
+
+
 async def _run_nexus_turn(messages: list[dict], session_id: str) -> tuple[str, list[str], list[str]]:
     conversation = list(messages)
     delegated_to: list[str] = []
@@ -381,30 +473,93 @@ async def _run_nexus_turn(messages: list[dict], session_id: str) -> tuple[str, l
             return choice_message.get("content") or "", delegated_to, searched_web
 
         conversation.append(choice_message)
-        for call in tool_calls:
-            name = call["function"]["name"]
-            if name == "delegate_to_agent":
-                agent_name, result_text = await _execute_delegation(call, session_id)
-                if agent_name:
-                    delegated_to.append(agent_name)
-            elif name == "search_web":
-                query, result_text = await _execute_web_search(call)
-                if query:
-                    searched_web.append(query)
-            else:
-                result_text = f"Tool call failed: unknown tool '{name}'."
-            conversation.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "name": name,
-                    "content": result_text,
-                }
-            )
+        tool_messages, new_delegated, new_searched = await _execute_tool_calls(tool_calls, session_id)
+        delegated_to.extend(new_delegated)
+        searched_web.extend(new_searched)
+        conversation.extend(tool_messages)
 
     # Ran out of tool-call rounds -- force a plain final answer without further tool access.
     final = await _call_mistral(conversation, agent="nexus")
     return final, delegated_to, searched_web
+
+
+async def _stream_nexus_round(conversation: list[dict], tool_choice: str | dict):
+    """Streams one round of NEXUS's tool-resolution loop. Mistral, like OpenAI, sends only
+    `delta.content` when the model answers directly, or only `delta.tool_calls` deltas
+    (reassembled here by index) when it invokes a tool -- never both in the same round --
+    so live text only ever reaches the caller when it's a genuine final answer, never a
+    tool-invoking round's (nonexistent) content. Yields ("content", text) chunks as they
+    arrive, then exactly one ("tool_calls", [...]) if the model invoked a tool this round.
+    """
+    tool_calls_by_index: dict[int, dict] = {}
+    async for chunk in _stream_mistral_chunks(conversation, tools=_nexus_tools(), tool_choice=tool_choice, agent="nexus"):
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        if delta.get("content"):
+            yield "content", delta["content"]
+        for tc_delta in delta.get("tool_calls") or []:
+            idx = tc_delta.get("index", 0)
+            entry = tool_calls_by_index.setdefault(
+                idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+            )
+            if tc_delta.get("id"):
+                entry["id"] = tc_delta["id"]
+            fn_delta = tc_delta.get("function") or {}
+            if fn_delta.get("name"):
+                entry["function"]["name"] = fn_delta["name"]
+            if fn_delta.get("arguments"):
+                entry["function"]["arguments"] += fn_delta["arguments"]
+
+    if tool_calls_by_index:
+        yield "tool_calls", [tool_calls_by_index[i] for i in sorted(tool_calls_by_index)]
+
+
+async def _run_nexus_turn_stream(messages: list[dict], session_id: str):
+    """Streaming counterpart to _run_nexus_turn. A tool-resolution round never streams
+    partial text to the caller by itself -- per _stream_nexus_round, a round is either a
+    silent tool call or the final answer -- so only the round that actually settles on a
+    plain-text reply ever produces ("delta", ...) events. Yields ("delta", text) for each
+    chunk of that final answer, then exactly one ("done", (full_text, delegated_to, searched_web)).
+    """
+    conversation = list(messages)
+    delegated_to: list[str] = []
+    searched_web: list[str] = []
+    force_search = bool(TAVILY_API_KEY) and messages and _looks_time_sensitive(messages[-1]["content"])
+
+    for round_num in range(MAX_TOOL_ROUNDS_PER_TURN):
+        tool_choice = (
+            {"type": "function", "function": {"name": "search_web"}} if force_search and round_num == 0 else "auto"
+        )
+        content_parts: list[str] = []
+        tool_calls: list[dict] | None = None
+        async for kind, value in _stream_nexus_round(conversation, tool_choice):
+            if kind == "content":
+                content_parts.append(value)
+                yield "delta", value
+            else:
+                tool_calls = value
+
+        if tool_calls is None:
+            yield "done", ("".join(content_parts), delegated_to, searched_web)
+            return
+
+        conversation.append({"role": "assistant", "content": None, "tool_calls": tool_calls})
+        tool_messages, new_delegated, new_searched = await _execute_tool_calls(tool_calls, session_id)
+        delegated_to.extend(new_delegated)
+        searched_web.extend(new_searched)
+        conversation.extend(tool_messages)
+
+    # Ran out of tool-call rounds -- force a streamed final answer without further tool access.
+    full_text = ""
+    async for chunk in _stream_mistral_chunks(conversation, agent="nexus"):
+        choices = chunk.get("choices") or []
+        delta_content = (choices[0].get("delta") or {}).get("content") if choices else None
+        if delta_content:
+            full_text += delta_content
+            yield "delta", delta_content
+    yield "done", (full_text, delegated_to, searched_web)
 
 
 def _schedule_digest(agent: str) -> None:
@@ -429,7 +584,12 @@ async def _run_digest_safely(agent: str) -> None:
         )
 
 
-async def run_agent_chat(agent: str, message: str, session_id: str | None) -> ChatResponse:
+async def _prepare_chat_messages(agent: str, message: str, session_id: str | None) -> tuple[list[dict], str]:
+    """Builds the full message list for one chat turn -- system prompt/override, the
+    cross-agent profile, this agent's own digest, semantic recall, the recent tail, and the
+    new user message -- and resolves a session id. Shared by the streaming and
+    non-streaming chat paths, which differ only in how the reply itself is produced.
+    """
     if len(message) > MAX_MESSAGE_LENGTH:
         raise HTTPException(
             status_code=400,
@@ -437,7 +597,6 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
         )
 
     session_id = session_id or str(uuid.uuid4())
-    request_started_at = datetime.now(timezone.utc).isoformat()
 
     recent_tail = await asyncio.to_thread(get_history, session_id, agent, RECENT_TAIL_LIMIT)
     digest_text = await asyncio.to_thread(get_digest_text, agent)
@@ -472,24 +631,39 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
         lines += [f"{turn['role']}: {turn['content']}" for turn in semantic_context]
         messages.append({"role": "system", "content": "\n".join(lines)})
     messages += recent_tail + [{"role": "user", "content": message}]
+    return messages, session_id
 
-    if agent == "nexus":
-        reply, delegated_to, searched_web = await _run_nexus_turn(messages, session_id)
-    else:
-        reply, delegated_to, searched_web = await _call_mistral(messages, agent=agent), [], []
 
+async def _finalize_chat_turn(agent: str, session_id: str, message: str, reply: str, request_started_at: str) -> int:
+    """Stores both sides of the turn, schedules embedding, and triggers a digest cycle if
+    warranted. Identical for the streaming and non-streaming paths, run only once the
+    complete reply text is known. Returns the stored assistant message's id.
+    """
     user_message_id = await asyncio.to_thread(add_message, session_id, agent, "user", message)
     message_id = await asyncio.to_thread(add_message, session_id, agent, "assistant", reply)
     _schedule_embedding(user_message_id, message)
     _schedule_embedding(message_id, reply)
 
     # Bookkeeping for the next digest cycle -- note_turns compares request_started_at
-    # (captured before the Mistral call) against the *previous* exchange's timestamp,
-    # so a slow reply from Mistral this turn never gets mistaken for a conversational
-    # pause on the user's part.
+    # (captured before any of this turn's work) against the *previous* exchange's
+    # timestamp, so a slow reply from Mistral this turn never gets mistaken for a
+    # conversational pause on the user's part.
     pause_triggered = await asyncio.to_thread(note_turns, agent, 2, request_started_at)
     if pause_triggered or await asyncio.to_thread(should_digest, agent):
         _schedule_digest(agent)
+    return message_id
+
+
+async def run_agent_chat(agent: str, message: str, session_id: str | None) -> ChatResponse:
+    request_started_at = datetime.now(timezone.utc).isoformat()
+    messages, session_id = await _prepare_chat_messages(agent, message, session_id)
+
+    if agent == "nexus":
+        reply, delegated_to, searched_web = await _run_nexus_turn(messages, session_id)
+    else:
+        reply, delegated_to, searched_web = await _call_mistral(messages, agent=agent), [], []
+
+    message_id = await _finalize_chat_turn(agent, session_id, message, reply, request_started_at)
 
     return ChatResponse(
         response=reply,
@@ -498,6 +672,54 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
         message_id=message_id,
         delegated_to=delegated_to,
         searched_web=searched_web,
+    )
+
+
+async def run_agent_chat_stream(agent: str, message: str, session_id: str | None):
+    """Streaming counterpart to run_agent_chat: identical context-building, and identical
+    storage/scheduling once the reply is complete, but yields the reply's tokens as
+    Server-Sent Events as they arrive instead of waiting for the whole thing. Each frame is
+    `data: {...}\\n\\n` -- either `{"delta": "<text>"}` per chunk of generated text, or,
+    exactly once at the end, `{"done": true, "session_id", "message_id", "delegated_to",
+    "searched_web"}` carrying the same metadata run_agent_chat returns in its response
+    body. A Mistral failure becomes a `{"error": "<detail>"}` frame instead of an HTTP
+    error status -- the response already committed to 200 by the time any bytes went out --
+    and, matching the non-streaming path, nothing gets stored when that happens.
+    """
+    request_started_at = datetime.now(timezone.utc).isoformat()
+    messages, session_id = await _prepare_chat_messages(agent, message, session_id)
+
+    full_text = ""
+    delegated_to: list[str] = []
+    searched_web: list[str] = []
+
+    try:
+        if agent == "nexus":
+            async for kind, value in _run_nexus_turn_stream(messages, session_id):
+                if kind == "delta":
+                    yield _sse({"delta": value})
+                else:
+                    full_text, delegated_to, searched_web = value
+        else:
+            async for chunk in _stream_mistral_chunks(messages, category="chat", agent=agent):
+                choices = chunk.get("choices") or []
+                delta_content = (choices[0].get("delta") or {}).get("content") if choices else None
+                if delta_content:
+                    full_text += delta_content
+                    yield _sse({"delta": delta_content})
+    except HTTPException as exc:
+        yield _sse({"error": exc.detail})
+        return
+
+    message_id = await _finalize_chat_turn(agent, session_id, message, full_text, request_started_at)
+    yield _sse(
+        {
+            "done": True,
+            "session_id": session_id,
+            "message_id": message_id,
+            "delegated_to": delegated_to,
+            "searched_web": searched_web,
+        }
     )
 
 
@@ -604,6 +826,35 @@ async def chat_with_agent(
     if not has_persona(name):
         raise HTTPException(status_code=404, detail=f"Unknown agent '{name}'. Available: {list_personas()}")
     return await run_agent_chat(name, req.message, req.session_id)
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest, request: Request, x_api_key: str | None = Header(default=None)) -> StreamingResponse:
+    require_api_key(x_api_key)
+    enforce_rate_limit(x_api_key or (request.client.host if request.client else "unknown"))
+    # Checked here, not left to _prepare_chat_messages alone: run_agent_chat_stream is a
+    # generator, so nothing in its body runs until StreamingResponse starts consuming it --
+    # by then the 200 status is already committed and a 400 here couldn't surface cleanly.
+    if len(req.message) > MAX_MESSAGE_LENGTH:
+        raise HTTPException(
+            status_code=400, detail=f"Message too long ({len(req.message)} chars, max {MAX_MESSAGE_LENGTH})."
+        )
+    return StreamingResponse(run_agent_chat_stream("nexus", req.message, req.session_id), media_type="text/event-stream")
+
+
+@app.post("/agents/{name}/stream")
+async def chat_with_agent_stream(
+    name: str, req: ChatRequest, request: Request, x_api_key: str | None = Header(default=None)
+) -> StreamingResponse:
+    require_api_key(x_api_key)
+    enforce_rate_limit(x_api_key or (request.client.host if request.client else "unknown"))
+    if not has_persona(name):
+        raise HTTPException(status_code=404, detail=f"Unknown agent '{name}'. Available: {list_personas()}")
+    if len(req.message) > MAX_MESSAGE_LENGTH:
+        raise HTTPException(
+            status_code=400, detail=f"Message too long ({len(req.message)} chars, max {MAX_MESSAGE_LENGTH})."
+        )
+    return StreamingResponse(run_agent_chat_stream(name, req.message, req.session_id), media_type="text/event-stream")
 
 
 @app.post("/feedback")

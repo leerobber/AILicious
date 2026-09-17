@@ -25,6 +25,52 @@ async def _fake_post(self, url, json=None, headers=None, **kwargs):
     )
 
 
+def _sse_content_lines(deltas: list[str]) -> list[str]:
+    """Builds the SSE lines a real Mistral streaming response would send for a plain-text
+    reply: one `chat.completion.chunk`-shaped line per delta, then the `[DONE]` sentinel.
+    """
+    lines = ["data: " + json.dumps({"choices": [{"delta": {"content": delta}}]}) for delta in deltas]
+    lines.append("data: [DONE]")
+    return lines
+
+
+class _FakeStreamResponse:
+    def __init__(self, lines: list[str], status_code: int = 200):
+        self._lines = lines
+        self.status_code = status_code
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+    async def aread(self):
+        return b""
+
+
+class _FakeStreamContext:
+    """httpx.AsyncClient.stream() is a plain (non-async) method that returns an async
+    context manager -- this mimics that shape so `async with client.stream(...) as resp`
+    in main.py works against a fake response instead of a real network call.
+    """
+
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+def _default_fake_stream(self, method, url, json=None, headers=None, **kwargs):
+    return _FakeStreamContext(_FakeStreamResponse(_sse_content_lines([mock_reply_content])))
+
+
+def _parse_sse(raw_lines) -> list[dict]:
+    return [json.loads(line[len("data:") :].strip()) for line in raw_lines if line.startswith("data:")]
+
+
 @pytest.fixture(autouse=True)
 def _reset_rate_limit_state():
     reset_rate_limit()
@@ -56,6 +102,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(cost_module, "DB_PATH", db_path)
     digest_module._active_agents.clear()
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+    monkeypatch.setattr(httpx.AsyncClient, "stream", _default_fake_stream)
     sent_requests.clear()
     monkeypatch.setattr(f"{__name__}.mock_reply_content", "mocked reply")
 
@@ -1422,3 +1469,177 @@ def test_costs_filters_by_category(client):
 
     resp = client.get("/costs", headers={"X-API-Key": VALID_KEY}, params={"category": "digest"})
     assert resp.json()["by_category"] == []
+
+
+def test_stream_plain_agent_returns_full_text_via_delta_events(client, monkeypatch):
+    monkeypatch.setattr(
+        httpx.AsyncClient,
+        "stream",
+        lambda self, method, url, json=None, headers=None, **kwargs: _FakeStreamContext(
+            _FakeStreamResponse(_sse_content_lines(["Hello", ", ", "world!"]))
+        ),
+    )
+
+    with client.stream(
+        "POST", "/agents/forge/stream", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}
+    ) as resp:
+        assert resp.status_code == 200
+        events = _parse_sse(resp.iter_lines())
+
+    deltas = [e["delta"] for e in events if "delta" in e]
+    assert "".join(deltas) == "Hello, world!"
+
+    done_events = [e for e in events if e.get("done")]
+    assert len(done_events) == 1
+    assert done_events[0]["session_id"]
+    assert isinstance(done_events[0]["message_id"], int)
+    assert done_events[0]["delegated_to"] == []
+    assert done_events[0]["searched_web"] == []
+
+
+def test_stream_agent_stores_the_turn_like_the_non_streaming_path(client):
+    with client.stream(
+        "POST", "/agents/forge/stream", headers={"X-API-Key": VALID_KEY}, json={"message": "remember this"}
+    ) as resp:
+        events = _parse_sse(resp.iter_lines())
+
+    session_id = next(e["session_id"] for e in events if e.get("done"))
+
+    from core.memory import get_history
+
+    history = get_history(session_id, "forge")
+    assert any(m["content"] == "remember this" for m in history)
+    assert any(m["content"] == mock_reply_content for m in history)
+
+
+def test_stream_nexus_plain_answer_uses_tool_choice_auto(client):
+    """NEXUS always streams with tools attached (tool_choice="auto") -- the default fake
+    stream returns plain content with no tool_calls, exactly like a real turn where the
+    model just answers. Confirms that path still yields real delta events.
+    """
+    with client.stream(
+        "POST", "/agents/nexus/stream", headers={"X-API-Key": VALID_KEY}, json={"message": "hi nexus"}
+    ) as resp:
+        assert resp.status_code == 200
+        events = _parse_sse(resp.iter_lines())
+
+    deltas = "".join(e["delta"] for e in events if "delta" in e)
+    assert deltas == mock_reply_content
+
+
+def test_stream_nexus_delegates_via_reassembled_tool_call_deltas(client, monkeypatch):
+    """The realistic mixed case: NEXUS's own rounds are streamed, but delegation itself
+    runs the delegate agent's turn through the ordinary non-streaming path (run_agent_chat),
+    which uses httpx.AsyncClient.post, not .stream -- both mocks are exercised in one turn.
+    """
+    tool_call_args = json.dumps({"agent": "forge", "task": "write a hello function"})
+    round1_lines = [
+        "data: "
+        + json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "function": {"name": "delegate_to_agent", "arguments": tool_call_args},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ),
+        "data: [DONE]",
+    ]
+    round2_lines = _sse_content_lines(["NEXUS synthesizes the final answer."])
+    stream_log: list[dict] = []
+
+    def sequenced_stream(self, method, url, json=None, headers=None, **kwargs):
+        stream_log.append(json)
+        lines = round1_lines if len(stream_log) == 1 else round2_lines
+        return _FakeStreamContext(_FakeStreamResponse(lines))
+
+    monkeypatch.setattr(httpx.AsyncClient, "stream", sequenced_stream)
+
+    with client.stream(
+        "POST",
+        "/agents/nexus/stream",
+        headers={"X-API-Key": VALID_KEY},
+        json={"message": "ask forge for a hello function"},
+    ) as resp:
+        assert resp.status_code == 200
+        events = _parse_sse(resp.iter_lines())
+
+    # Round 1 was a pure tool call -- Mistral sends no content in that case, so nothing
+    # should have streamed to the client until round 2's real final answer.
+    deltas = "".join(e["delta"] for e in events if "delta" in e)
+    assert deltas == "NEXUS synthesizes the final answer."
+    assert len(stream_log) == 2
+
+    done = next(e for e in events if e.get("done"))
+    assert done["delegated_to"] == ["forge"]
+
+    from core.memory import get_history
+
+    forge_history = get_history(done["session_id"], "forge")
+    assert any(m["content"] == "write a hello function" for m in forge_history)
+
+
+def test_stream_rejects_message_too_long_before_streaming(client):
+    with client.stream(
+        "POST",
+        "/agents/nexus/stream",
+        headers={"X-API-Key": VALID_KEY},
+        json={"message": "x" * 5000},
+    ) as resp:
+        assert resp.status_code == 400
+        body = json.loads(resp.read())
+    assert "too long" in body["detail"]
+
+
+def test_stream_rejects_unknown_agent(client):
+    with client.stream(
+        "POST", "/agents/not-a-real-agent/stream", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}
+    ) as resp:
+        assert resp.status_code == 404
+
+
+def test_stream_requires_api_key(client):
+    with client.stream("POST", "/agents/forge/stream", json={"message": "hi"}) as resp:
+        assert resp.status_code == 401
+
+
+def test_stream_mistral_error_yields_error_event_and_stores_nothing(client, monkeypatch):
+    def failing_stream(self, method, url, json=None, headers=None, **kwargs):
+        return _FakeStreamContext(_FakeStreamResponse(["data: not valid json but ignored"], status_code=500))
+
+    monkeypatch.setattr(httpx.AsyncClient, "stream", failing_stream)
+
+    with client.stream(
+        "POST", "/agents/forge/stream", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}
+    ) as resp:
+        assert resp.status_code == 200  # already committed by the time the failure is known
+        events = _parse_sse(resp.iter_lines())
+
+    assert len(events) == 1
+    assert "error" in events[0]
+
+    stats = client.get("/memory/stats", headers={"X-API-Key": VALID_KEY}).json()
+    assert stats["total_messages"] == 0
+
+
+def test_stream_does_not_record_token_usage(client):
+    """Honest, documented gap: _stream_mistral_chunks never requests stream_options, so a
+    real Mistral streaming response never reports usage on any chunk -- confirms that stays
+    true rather than silently starting to record (which would mean the assumption changed
+    without anyone noticing)."""
+    with client.stream(
+        "POST", "/agents/forge/stream", headers={"X-API-Key": VALID_KEY}, json={"message": "hi"}
+    ) as resp:
+        _parse_sse(resp.iter_lines())
+
+    summary = client.get("/costs", headers={"X-API-Key": VALID_KEY}).json()
+    assert summary["totals"]["calls"] == 0
