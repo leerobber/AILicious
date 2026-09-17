@@ -53,6 +53,20 @@ Fixed by reformatting search results as clearly delimited `[Source N] <url>` blo
 
 Both chat endpoints are also rate-limited (default 20 requests/minute, per API key — or per client IP locally if `APP_API_KEY` is unset) and cap message length (default 4000 characters), to keep a leaked key or a client bug from running up unbounded Mistral usage. Tune via `RATE_LIMIT_PER_MINUTE` and `MAX_MESSAGE_LENGTH`; exceeding either returns a normal error the PWA already displays inline (429 with a `Retry-After` header, or 400).
 
+### Read-only GitHub access
+
+NEXUS can also carry a `read_github_file` tool, added to its request only when `GITHUB_PAT` is set — same conditional-offering pattern as `search_web` and `TAVILY_API_KEY`, omitted entirely otherwise. When offered and called with a `{repo, path}`, it fetches that file's real content via the GitHub REST API's contents endpoint and hands it back as the tool result, so NEXUS can answer questions about actual code instead of guessing at it.
+
+Deliberately narrow, by design rather than as an afterthought:
+
+- **Read-only, structurally, not just by convention.** There is no write tool, no code path that ever sends anything but a `GET` to GitHub's API. Nothing added here could write to a repository even if a bug in the dispatch logic tried to.
+- **Scoped to an explicit allowlist, enforced twice.** The credential this expects is a GitHub *fine-grained* personal access token, restricted at creation time to specific repositories with only `Contents: Read-only` permission — never a classic PAT's all-repos `repo` scope. `GITHUB_ALLOWED_REPOS` (a comma-separated `owner/repo` list) enforces the same boundary again on the server, so a token that ends up more broadly scoped than intended still can't reach anything beyond what's explicitly named here.
+- **NEXUS-only**, matching `delegate_to_agent` and `search_web` — no other persona carries tool access, which structurally rules out tool-call loops between agents. Another persona reaching GitHub content today means NEXUS delegating to it with the fetched file already in hand.
+
+Same dispatch loop as delegation and search (`_execute_tool_calls` in `main.py`): malformed tool-call arguments, a disallowed repo, a directory instead of a file, a file over GitHub's 1MB inline-content limit, or an API error all come back as a plain tool result NEXUS can react to and explain, never a crash. A successful read past `GITHUB_MAX_FILE_CHARS` (20,000 characters) is truncated rather than blowing out the context window. `ChatResponse` gains a `read_from_github: list[str]` field (`"owner/repo:path"` per file actually read this turn), surfaced in the PWA as the same kind of ground-truth badge `delegated_to`/`searched_web` already get.
+
+Tested the same way as the other two tools: the tool is absent by default and present only when `GITHUB_PAT` is configured; a real read-and-cite round trip through both the streaming and non-streaming chat paths (mocking the GitHub API's response, not a real repository); malformed arguments never reach the GitHub API at all; and `_execute_github_read` unit-tested directly for every failure mode (no token, disallowed repo, directory, oversized file, truncation, a real API error). Deliberate-break-confirmed on the allowlist check specifically, since it's the actual security boundary: disabling it let a request for a non-allowlisted repo fall through to an actual outbound call instead of being rejected server-side.
+
 Every chat response includes a `message_id`; `POST /feedback` (`{message_id, rating}`, rating `1` or `-1`) records a thumbs up/down on that specific reply. The PWA shows this as small thumb icons under each assistant message. This is entirely optional now — see KAIROS below — but a flagged message still gets folded into the next digest cycle as extra-weighted signal if you use it.
 
 ### KAIROS (automatic conversation digestion)
@@ -273,7 +287,7 @@ To set it up:
 ### Deploy to Render
 
 1. Push this repo to GitHub and create a new **Blueprint** on [Render](https://render.com) pointing at it — it will pick up `render.yaml` automatically.
-2. Set `MISTRAL_API_KEY` and `APP_API_KEY` in the Render dashboard (marked `sync: false` in the blueprint so they aren't committed). Optionally set `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN` too, per above, for memory that survives redeploys. Optionally set `TAVILY_API_KEY` (from [tavily.com](https://tavily.com)) to enable NEXUS's real web search tool — omit it and NEXUS simply never gets offered that tool, no error, no broken deploy.
+2. Set `MISTRAL_API_KEY` and `APP_API_KEY` in the Render dashboard (marked `sync: false` in the blueprint so they aren't committed). Optionally set `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN` too, per above, for memory that survives redeploys. Optionally set `TAVILY_API_KEY` (from [tavily.com](https://tavily.com)) to enable NEXUS's real web search tool — omit it and NEXUS simply never gets offered that tool, no error, no broken deploy. Optionally set `GITHUB_PAT` (a fine-grained token, repo-restricted, `Contents: Read-only` — see `.env.example`) plus `GITHUB_ALLOWED_REPOS` to enable NEXUS's read-only GitHub tool — same omit-and-nothing-breaks pattern.
 3. Once deployed, verify with `curl https://<your-service>.onrender.com/health`.
 
 ### Next steps
