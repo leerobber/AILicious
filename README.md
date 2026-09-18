@@ -164,7 +164,11 @@ Every regression in this project so far (NEXUS declining to search, fabricating 
 - `evals/judge.py` — builds the judge prompt and strictly parses its `{"passed": bool, "reasoning": str}` verdict; a malformed judge response raises rather than silently counting as a pass.
 - `evals/run_evals.py` — the runner: sends every case to a real, running backend's `/agents/{agent}`, judges the real response with a real Mistral call, prints a pass/fail summary, appends one compact line to `evals/history.jsonl` (git-tracked, so pass-rate trend over time is visible in the repo's own history), writes a full per-case report to `evals/results/<timestamp>.json` (gitignored — local inspection only), and exits non-zero if anything failed.
 
-**Deliberately not wired into `.github/workflows/ci.yml`.** This needs a real `MISTRAL_API_KEY` and hits the real API twice per case (once for the agent, once for the judge) — turning that into a required check on every push means adding a live API key as a GitHub secret and paying for real API calls on every commit, including ones that only touch documentation. That's a cost and infrastructure decision for whoever owns the repo's billing, not something to wire in silently on my own judgment. Run it yourself, on demand or on whatever schedule you want:
+**Wired into `.github/workflows/ci.yml` as a separate, opt-in `evals` job.** This needs a real `MISTRAL_API_KEY` and hits the real API twice per case (once for the agent, once for the judge), so it's gated on `secrets.MISTRAL_API_KEY` being set (`if: ${{ secrets.MISTRAL_API_KEY != '' }}`) rather than being a required check from day one — a repo with no key configured just skips the job instead of failing every PR with a confusing "key required" error. Whoever owns the repo's billing opts in by adding the secret (Settings → Secrets and variables → Actions → `MISTRAL_API_KEY`); until then, nothing changes about CI cost or behavior.
+
+When it does run, the job starts its own backend instance locally (`uvicorn main:app`, polled on `/health` until ready) with **no `TURSO_DATABASE_URL` set** — deliberately, so `core/db.py`'s existing local-SQLite fallback gives every CI run a fresh, disposable database. Synthetic eval chat turns must never land in the real production database or its Turso replica and pollute real digest/profile/SAGE signal, so the eval job only ever talks to this isolated local instance, never to the deployed Render service. The runner's full per-case JSON report is uploaded as a build artifact (`eval-results`) on every run, pass or fail, for inspection without re-running locally.
+
+You can still run it by hand the same way, against the deployed service or anywhere else:
 
 ```bash
 cd backend
@@ -174,7 +178,7 @@ MISTRAL_API_KEY=... \
 python -m evals.run_evals
 ```
 
-What *is* in the required pytest suite (`tests/test_eval_judge.py`, no real API key needed): the harness logic itself — verdict parsing (valid pass/fail, missing/non-string reasoning, non-boolean `passed`, malformed JSON) and a sanity check that every eval case has the required fields and a unique id. That catches a broken harness; it can't catch a broken agent — only an actual run against a real backend does that, which is exactly why this half is opt-in rather than automatic.
+What's in the required pytest suite (`tests/test_eval_judge.py`, no real API key needed) is unchanged: the harness logic itself — verdict parsing (valid pass/fail, missing/non-string reasoning, non-boolean `passed`, malformed JSON) and a sanity check that every eval case has the required fields and a unique id. That catches a broken harness; it can't catch a broken agent — only an actual run against a real backend does that, which is exactly what the new CI job now does automatically once its secret is configured.
 
 ### Observability
 
