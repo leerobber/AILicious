@@ -23,13 +23,26 @@ jobs:
         working-directory: backend
         run: pytest -v
 
-  evals:
+  check-mistral-key:
     runs-on: ubuntu-latest
+    # The `secrets` context can't be referenced directly in a job-level `if:` --
+    # GitHub Actions rejects that as an invalid workflow ("Unrecognized named-value:
+    # 'secrets'"). Resolving it inside a step (where `secrets` is allowed) and
+    # exposing it as a job output is the documented workaround.
+    outputs:
+      is-set: ${{ steps.check.outputs.is-set }}
+    steps:
+      - id: check
+        run: echo "is-set=${{ secrets.MISTRAL_API_KEY != '' }}" >> "$GITHUB_OUTPUT"
+
+  evals:
+    needs: check-mistral-key
     # Runs only once MISTRAL_API_KEY is configured as a repo secret -- without it, this
     # would just fail with a clear "key required" message on every PR before anyone's
     # had a chance to set it up, which reads as a false regression rather than missing
     # config. See README's "Automated evals" section for the full rationale.
-    if: ${{ secrets.MISTRAL_API_KEY != '' }}
+    if: needs.check-mistral-key.outputs.is-set == 'true'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
