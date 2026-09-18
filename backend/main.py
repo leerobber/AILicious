@@ -518,6 +518,37 @@ def _looks_time_sensitive(message: str) -> bool:
     return any(keyword in lowered for keyword in _TIME_SENSITIVE_KEYWORDS)
 
 
+# Live-tested after shipping read_github_file: the exact same tool_choice="auto"
+# unreliability documented above for search_web, reproduced directly against the
+# deployed app -- of 4 identical live requests asking NEXUS to read a real file from an
+# allowed repo (one of them explicitly saying "use your read_github_file tool"), only 1
+# actually called the tool; the other 3 answered as if it didn't exist. Same fix: force
+# the specific tool on the first round for messages that look like a GitHub-file request.
+_GITHUB_KEYWORDS = ("github", "repo", "readme")
+
+
+def _looks_like_github_request(message: str) -> bool:
+    lowered = message.lower()
+    return any(keyword in lowered for keyword in _GITHUB_KEYWORDS)
+
+
+def _forced_tool_choice(message: str, round_num: int) -> str | dict:
+    """First-round tool_choice for NEXUS's tool loop. Forces the one specific tool a
+    message's own heuristic signal calls for, rather than leaving the decision to
+    Mistral's "auto" -- live-tested unreliable for both tools this project has shipped
+    so far. Search takes priority on the rare message that could plausibly trigger both
+    heuristics at once; there's no real-world case yet where forcing the wrong one of the
+    two actually matters, so this is simple tie-breaking, not a considered ranking.
+    """
+    if round_num != 0:
+        return "auto"
+    if bool(TAVILY_API_KEY) and _looks_time_sensitive(message):
+        return {"type": "function", "function": {"name": "search_web"}}
+    if bool(GITHUB_PAT) and _looks_like_github_request(message):
+        return {"type": "function", "function": {"name": "read_github_file"}}
+    return "auto"
+
+
 async def _execute_tool_calls(
     tool_calls: list[dict], session_id: str
 ) -> tuple[list[dict], list[str], list[str], list[str]]:
@@ -556,13 +587,10 @@ async def _run_nexus_turn(messages: list[dict], session_id: str) -> tuple[str, l
     delegated_to: list[str] = []
     searched_web: list[str] = []
     read_from_github: list[str] = []
-
-    force_search = bool(TAVILY_API_KEY) and messages and _looks_time_sensitive(messages[-1]["content"])
+    last_message = messages[-1]["content"] if messages else ""
 
     for round_num in range(MAX_TOOL_ROUNDS_PER_TURN):
-        tool_choice = (
-            {"type": "function", "function": {"name": "search_web"}} if force_search and round_num == 0 else "auto"
-        )
+        tool_choice = _forced_tool_choice(last_message, round_num)
         data = await _call_mistral_raw(conversation, tools=_nexus_tools(), tool_choice=tool_choice, agent="nexus")
         choice_message = data["choices"][0]["message"]
         tool_calls = choice_message.get("tool_calls")
@@ -627,12 +655,10 @@ async def _run_nexus_turn_stream(messages: list[dict], session_id: str):
     delegated_to: list[str] = []
     searched_web: list[str] = []
     read_from_github: list[str] = []
-    force_search = bool(TAVILY_API_KEY) and messages and _looks_time_sensitive(messages[-1]["content"])
+    last_message = messages[-1]["content"] if messages else ""
 
     for round_num in range(MAX_TOOL_ROUNDS_PER_TURN):
-        tool_choice = (
-            {"type": "function", "function": {"name": "search_web"}} if force_search and round_num == 0 else "auto"
-        )
+        tool_choice = _forced_tool_choice(last_message, round_num)
         content_parts: list[str] = []
         tool_calls: list[dict] | None = None
         async for kind, value in _stream_nexus_round(conversation, tool_choice):
