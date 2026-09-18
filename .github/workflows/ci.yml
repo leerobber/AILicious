@@ -22,3 +22,72 @@ jobs:
       - name: Run tests
         working-directory: backend
         run: pytest -v
+
+  check-mistral-key:
+    runs-on: ubuntu-latest
+    # The `secrets` context can't be referenced directly in a job-level `if:` --
+    # GitHub Actions rejects that as an invalid workflow ("Unrecognized named-value:
+    # 'secrets'"). Resolving it inside a step (where `secrets` is allowed) and
+    # exposing it as a job output is the documented workaround.
+    outputs:
+      is-set: ${{ steps.check.outputs.is-set }}
+    steps:
+      - id: check
+        run: echo "is-set=${{ secrets.MISTRAL_API_KEY != '' }}" >> "$GITHUB_OUTPUT"
+
+  evals:
+    needs: check-mistral-key
+    # Runs only once MISTRAL_API_KEY is configured as a repo secret -- without it, this
+    # would just fail with a clear "key required" message on every PR before anyone's
+    # had a chance to set it up, which reads as a false regression rather than missing
+    # config. See README's "Automated evals" section for the full rationale.
+    if: needs.check-mistral-key.outputs.is-set == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Start backend against an isolated local database
+        working-directory: backend
+        env:
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          APP_API_KEY: ci-eval-key
+        # No TURSO_DATABASE_URL here, deliberately: this must never touch the real
+        # production database (or its Turso replica) with synthetic eval chat turns --
+        # core/db.py's existing local-SQLite fallback gives every CI run a fresh,
+        # disposable database instead.
+        run: |
+          nohup uvicorn main:app --host 127.0.0.1 --port 8000 > /tmp/uvicorn.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/health > /dev/null; then
+              echo "Backend is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Backend failed to start in time"
+          cat /tmp/uvicorn.log
+          exit 1
+
+      - name: Run evals
+        working-directory: backend
+        env:
+          EVAL_BASE_URL: http://127.0.0.1:8000
+          APP_API_KEY: ci-eval-key
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+        run: python -m evals.run_evals
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: backend/evals/results/
+          if-no-files-found: ignore
