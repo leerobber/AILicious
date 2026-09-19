@@ -1,4 +1,4 @@
-const CACHE_NAME = "ailicious-shell-v2";
+const CACHE_NAME = "aethyro-shell-v1";
 const APP_SHELL = ["/", "/manifest.json", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (event) => {
