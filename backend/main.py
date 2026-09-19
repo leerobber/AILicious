@@ -55,6 +55,26 @@ RECENT_TAIL_LIMIT = 6  # short raw window; the conversation digest carries the r
 SEMANTIC_RECALL_LIMIT = 4  # extra older messages surfaced by similarity, beyond the flat recency tail
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "20"))
 MAX_MESSAGE_LENGTH = int(os.environ.get("MAX_MESSAGE_LENGTH", "4000"))
+
+# Consumer-facing voice modes (Aethyro pivot): a lightweight system-message nudge layered
+# on top of an agent's own persona, not a replacement for it. "helpful" is the persona's
+# own default tone, so it adds nothing here -- an unrecognized or missing value is treated
+# the same way, which keeps an old client that never sends `tone` behaving exactly as before.
+TONE_DIRECTIVES = {
+    "casual": (
+        "Voice mode: Casual. Stay warm and conversational, lightly playful where it fits "
+        "naturally. Still fully useful -- never sacrifice a correct, complete answer for a joke."
+    ),
+    "unhinged": (
+        "Voice mode: Unhinged-ish. Be funny and self-aware, with personality -- but never at "
+        "the user's expense. Humor should make them feel seen, not stupid. Stay accurate and "
+        "genuinely useful underneath the jokes; the humor is seasoning, not the answer."
+    ),
+    "focus": (
+        "Voice mode: Focus. Be concise and direct. No jokes, no filler, no preamble -- the "
+        "shortest complete answer that actually solves the request."
+    ),
+}
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 _background_tasks: set[asyncio.Task] = set()
@@ -73,12 +93,13 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="AILicious Backend", lifespan=lifespan)
+app = FastAPI(title="Aethyro Backend", lifespan=lifespan)
 
 
 class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
+    tone: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -712,7 +733,9 @@ async def _run_digest_safely(agent: str) -> None:
         )
 
 
-async def _prepare_chat_messages(agent: str, message: str, session_id: str | None) -> tuple[list[dict], str]:
+async def _prepare_chat_messages(
+    agent: str, message: str, session_id: str | None, tone: str | None = None
+) -> tuple[list[dict], str]:
     """Builds the full message list for one chat turn -- system prompt/override, the
     cross-agent profile, this agent's own digest, semantic recall, the recent tail, and the
     new user message -- and resolves a session id. Shared by the streaming and
@@ -748,6 +771,9 @@ async def _prepare_chat_messages(agent: str, message: str, session_id: str | Non
             semantic_context = top_k_similar(query_embedding, candidates, SEMANTIC_RECALL_LIMIT)
 
     messages = [{"role": "system", "content": system_prompt}]
+    tone_directive = TONE_DIRECTIVES.get((tone or "").lower())
+    if tone_directive:
+        messages.append({"role": "system", "content": tone_directive})
     if profile_text:
         messages.append(
             {"role": "system", "content": f"What you know about this user across all AILicious agents:\n{profile_text}"}
@@ -782,9 +808,9 @@ async def _finalize_chat_turn(agent: str, session_id: str, message: str, reply: 
     return message_id
 
 
-async def run_agent_chat(agent: str, message: str, session_id: str | None) -> ChatResponse:
+async def run_agent_chat(agent: str, message: str, session_id: str | None, tone: str | None = None) -> ChatResponse:
     request_started_at = datetime.now(timezone.utc).isoformat()
-    messages, session_id = await _prepare_chat_messages(agent, message, session_id)
+    messages, session_id = await _prepare_chat_messages(agent, message, session_id, tone)
 
     if agent == "nexus":
         reply, delegated_to, searched_web, read_from_github = await _run_nexus_turn(messages, session_id)
@@ -804,7 +830,7 @@ async def run_agent_chat(agent: str, message: str, session_id: str | None) -> Ch
     )
 
 
-async def run_agent_chat_stream(agent: str, message: str, session_id: str | None):
+async def run_agent_chat_stream(agent: str, message: str, session_id: str | None, tone: str | None = None):
     """Streaming counterpart to run_agent_chat: identical context-building, and identical
     storage/scheduling once the reply is complete, but yields the reply's tokens as
     Server-Sent Events as they arrive instead of waiting for the whole thing. Each frame is
@@ -816,7 +842,7 @@ async def run_agent_chat_stream(agent: str, message: str, session_id: str | None
     went out -- and, matching the non-streaming path, nothing gets stored when that happens.
     """
     request_started_at = datetime.now(timezone.utc).isoformat()
-    messages, session_id = await _prepare_chat_messages(agent, message, session_id)
+    messages, session_id = await _prepare_chat_messages(agent, message, session_id, tone)
 
     full_text = ""
     delegated_to: list[str] = []
@@ -945,7 +971,7 @@ async def costs(category: str | None = None, x_api_key: str | None = Header(defa
 async def chat(req: ChatRequest, request: Request, x_api_key: str | None = Header(default=None)) -> ChatResponse:
     require_api_key(x_api_key)
     enforce_rate_limit(x_api_key or (request.client.host if request.client else "unknown"))
-    return await run_agent_chat("nexus", req.message, req.session_id)
+    return await run_agent_chat("nexus", req.message, req.session_id, req.tone)
 
 
 @app.post("/agents/{name}", response_model=ChatResponse)
@@ -956,7 +982,7 @@ async def chat_with_agent(
     enforce_rate_limit(x_api_key or (request.client.host if request.client else "unknown"))
     if not has_persona(name):
         raise HTTPException(status_code=404, detail=f"Unknown agent '{name}'. Available: {list_personas()}")
-    return await run_agent_chat(name, req.message, req.session_id)
+    return await run_agent_chat(name, req.message, req.session_id, req.tone)
 
 
 @app.post("/chat/stream")
@@ -970,7 +996,9 @@ async def chat_stream(req: ChatRequest, request: Request, x_api_key: str | None 
         raise HTTPException(
             status_code=400, detail=f"Message too long ({len(req.message)} chars, max {MAX_MESSAGE_LENGTH})."
         )
-    return StreamingResponse(run_agent_chat_stream("nexus", req.message, req.session_id), media_type="text/event-stream")
+    return StreamingResponse(
+        run_agent_chat_stream("nexus", req.message, req.session_id, req.tone), media_type="text/event-stream"
+    )
 
 
 @app.post("/agents/{name}/stream")
@@ -985,7 +1013,9 @@ async def chat_with_agent_stream(
         raise HTTPException(
             status_code=400, detail=f"Message too long ({len(req.message)} chars, max {MAX_MESSAGE_LENGTH})."
         )
-    return StreamingResponse(run_agent_chat_stream(name, req.message, req.session_id), media_type="text/event-stream")
+    return StreamingResponse(
+        run_agent_chat_stream(name, req.message, req.session_id, req.tone), media_type="text/event-stream"
+    )
 
 
 @app.post("/feedback")

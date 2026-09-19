@@ -1,7 +1,7 @@
 {
-  "name": "AILicious",
-  "short_name": "AILicious",
-  "description": "Personality-driven multi-agent AI assistant",
+  "name": "Aethyro",
+  "short_name": "Aethyro",
+  "description": "Your personal AI team — ask anything, get it handled.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

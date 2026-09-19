@@ -1,10 +1,12 @@
-# AILicious
+# AILicious (Aethyro)
 
 Personality-driven, multi-agent AI system with cloud-based inference and memory, accessible from Android via a web client. All compute runs server-side — no local hardware or model downloads required.
 
+`AILicious` is this repo/backend's internal codename; the consumer-facing product is branded **Aethyro**. The PWA's default experience is a single unified chat with NEXUS (presented to users as "Aethyro" itself) as the host — it silently delegates to the other five specialist personas (FORGE/Builder, ORACLE/Analyst, SENTINEL/Guardian, CODEX/Archivist, AVERY/Companion) and surfaces that as plain-language "Brought in Builder"-style badges rather than requiring the user to pick an agent up front. Direct 1:1 access to any specialist is still available via the "Your AI team" panel for users who want it. See `backend/static/index.html` for the friendly-name mapping (`AGENT_META`) and `backend/config/personas/*.yaml` for each persona's underlying technical definition.
+
 ## Android / web client
 
-A single-page PWA is served directly by the backend at `/` (`backend/static/index.html` — no build step, no separate host). Open the Render URL on an Android phone in Chrome, enter the API key in Settings (gear icon), pick an agent from the dropdown, and chat. "Add to Home Screen" installs it as a standalone app icon via the manifest + service worker in `backend/static/`.
+A single-page PWA is served directly by the backend at `/` (`backend/static/index.html` — no build step, no separate host). Open the Render URL on an Android phone in Chrome, enter the API key in Settings (gear icon), and start typing — Aethyro (NEXUS) is the default host and routes to a specialist automatically when one fits better. Settings also has a "How should Aethyro talk to you?" tone toggle (Helpful/Casual/Unhinged-ish/Focus), sent to the backend as an optional `tone` field on chat requests and layered on top of the agent's own persona prompt. Power users who want to talk to one specialist directly can do so from the "Your AI team" panel (people icon in the header). "Add to Home Screen" installs it as a standalone app icon via the manifest + service worker in `backend/static/`.
 
 The service worker (`sw.js`) fetches network-first, caching only as an offline fallback — every successful load re-fetches from the live server, so a new deploy reaches an already-installed client on its very next load. (An earlier cache-first version pinned whatever `index.html` a client first cached indefinitely, since `CACHE_NAME` never changed between deploys — a real fix could ship and a phone would keep silently serving the old app shell forever. If a very old client still looks stale after this fix ships, one manual site-data clear resets it; every load after that self-heals.)
 
